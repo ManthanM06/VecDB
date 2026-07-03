@@ -1,6 +1,6 @@
 # Define the core database engine as a static library target
 add_library(vecdb_core 
-    dummy.cpp
+    core.cpp
 )
 
 # Define where header files live. 

@@ -40,3 +40,4 @@ compile_commands.json
 .clang-tidy
 
 .venv
+build_cmds.txt

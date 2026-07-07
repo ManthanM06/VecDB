@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>  // for std::runtime_error
+#include <string>
 #include <vector>
 
 namespace vecdb {
@@ -12,6 +14,12 @@ struct SearchResult {
   float distance;
 };
 
+class DatabaseError : public std::runtime_error {
+ public:
+  explicit DatabaseError(const std::string& message)
+      : std::runtime_error(message) {}
+};
+
 class VectorEngine {
  public:
   explicit VectorEngine(size_t dimensions);
@@ -19,7 +27,10 @@ class VectorEngine {
   std::vector<SearchResult> search(const std::vector<float>& query,
                                    size_t k) const;
 
-  // Notice size() now checks ids_.size()
+  // new persistant methods
+  void save(const std::string& file_path) const;
+  void load(const std::string& file_path);
+
   size_t size() const { return ids_.size(); }
   size_t dimensions() const { return dimensions_; }
 

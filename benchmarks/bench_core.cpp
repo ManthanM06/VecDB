@@ -17,8 +17,8 @@ std::vector<float> generate_random_vector(size_t dim, std::mt19937& gen) {
 
 // The benchmark fixture
 static void BM_BruteForceSearch(benchmark::State& state) {
-  size_t num_vectors =
-      state.range(0);  // This takes the arguments (1000, 5000, 10000)
+  size_t num_vectors = static_cast<size_t>(
+      state.range(0));  // This takes the arguments (1000, 5000, 10000)
   size_t dim = 128;
 
   vecdb::VectorEngine engine(dim);
@@ -26,7 +26,8 @@ static void BM_BruteForceSearch(benchmark::State& state) {
 
   // Setup: Populate the database with random vectors
   for (size_t i = 0; i < num_vectors; ++i) {
-    engine.insert(i, generate_random_vector(dim, gen));
+    engine.insert(static_cast<vecdb::VectorId>(i),
+                  generate_random_vector(dim, gen));
   }
 
   std::vector<float> query = generate_random_vector(dim, gen);

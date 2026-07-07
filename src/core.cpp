@@ -3,6 +3,8 @@
 #include <immintrin.h>  //hardware intrinsics header
 
 #include <algorithm>
+#include <cmath>
+#include <fstream>
 #include <queue>
 #include <stdexcept>
 
@@ -14,8 +16,27 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
     throw std::invalid_argument(
         "Vector dimensions do not match databse dimensiosn.");
   }
+  // L2 normalization
+  //  calc squared sum of all the elements
+  float sq_sum = 0.0f;
+  for (float val : data) {
+    sq_sum += val * val;
+  }
+
+  // calc magnitude
+  float magnitude = std::sqrt(sq_sum);
+
+  // prevent div by 0 if someone enteres an empty vector
+  if (magnitude == 0.0f) {
+    magnitude = 1.0f;
+  }
+
   ids_.push_back(id);
-  raw_data_.insert(raw_data_.end(), data.begin(), data.end());
+
+  // divide every elemet by the magnitude and append to flat array
+  for (float val : data) {
+    raw_data_.push_back(val / magnitude);
+  }
 }
 
 inline float simd_dot_product(const float* a, const float* b, size_t size) {
@@ -88,5 +109,90 @@ std::vector<SearchResult> VectorEngine::search(const std::vector<float>& query,
   }
   std::reverse(results.begin(), results.end());
   return results;
+}
+// A unique identifier: "VEC1" encoded as a 32-bit hex integer
+const uint32_t VECDB_MAGIC_NUMBER = 0x31434556;
+
+void VectorEngine::save(const std::string& file_path) const {
+  std::ofstream file(file_path, std::ios::binary);
+  if (!file) {
+    throw DatabaseError("Failed to open file for writing: " + file_path);
+  }
+  // 1. Write the Header (Magic Number, Vector Count, Dimensions)
+  file.write(reinterpret_cast<const char*>(&VECDB_MAGIC_NUMBER),
+             sizeof(uint32_t));
+
+  size_t num_vectors = ids_.size();
+  file.write(reinterpret_cast<const char*>(&num_vectors), sizeof(size_t));
+  file.write(reinterpret_cast<const char*>(&dimensions_), sizeof(size_t));
+
+  // 2. Dump the IDs array directly from RAM to SSD
+  if (num_vectors > 0) {
+    file.write(reinterpret_cast<const char*>(ids_.data()),
+               static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
+  }
+
+  // 3. Dump the float array directly from RAM to SSD
+  if (!raw_data_.empty()) {
+    file.write(reinterpret_cast<const char*>(raw_data_.data()),
+               static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
+  }
+
+  // Verify the write stream didn't fail midway
+  if (!file.good()) {
+    throw DatabaseError("An OS error occurred while writing data to disk.");
+  }
+}
+
+void VectorEngine::load(const std::string& file_path) {
+  std::ifstream file(file_path, std::ios::binary);
+  if (!file) {
+    throw DatabaseError("Failed to open file for reading: " + file_path);
+  }
+
+  // 1. Security Check: Verify the Magic Number
+  uint32_t magic = 0;
+  file.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+  // if (magic != VECDB_MAGIC_NUMBERR) {
+  //   throw DatabaseError(
+  //       "Corrupted or invalid file format. Magic number mismatch");
+  // }
+  if (magic != VECDB_MAGIC_NUMBER) {
+    std::string error_msg = "Magic number mismatch!\n";
+    error_msg += "Expected: " + std::to_string(VECDB_MAGIC_NUMBER) + "\n";
+    error_msg += "Got: " + std::to_string(magic) + "\n";
+    error_msg += "Bytes actually read: " + std::to_string(file.gcount()) + "\n";
+
+    throw DatabaseError(error_msg);
+  }
+
+  // 2. Read Metadata
+  size_t num_vectors = 0;
+  size_t file_dimensions = 0;
+  file.read(reinterpret_cast<char*>(&num_vectors), sizeof(size_t));
+  file.read(reinterpret_cast<char*>(&file_dimensions), sizeof(size_t));
+
+  if (file_dimensions != dimensions_) {
+    throw DatabaseError(
+        "Dimensions mismatch! Engine is configured for a different vector "
+        "size.");
+  }
+
+  // 3. The Performance Hack: Pre-allocate all memory instantly
+  // By resizing before reading, we guarantee contiguous memory and avoid
+  // the CPU wasting time dynamically expanding the vectors during the load.
+
+  ids_.resize(num_vectors);
+  raw_data_.resize(num_vectors * dimensions_);
+
+  // 4. Blast the bytes straight from the SSD into the pre-allocated RAM
+  if (num_vectors > 0) {
+    // Read expects a char*, not a const char*, because it has to modify the
+    // memory
+    file.read(reinterpret_cast<char*>(ids_.data()),
+              static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
+    file.read(reinterpret_cast<char*>(raw_data_.data()),
+              static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
+  }
 }
 }  // namespace vecdb

@@ -85,3 +85,57 @@ TEST(EngineTest, ExactBruteForceMatchesGroundTruth) {
     query_index++;
   }
 }
+
+TEST(PersistenceTest, CanSaveAndLoadBinaryDatabase) {
+  std::string db_path = "test_database.vec";
+
+  // force nukde file fome prev test
+  std::remove(db_path.c_str());
+
+  // Create a scope to force the engine to be destroyed
+  {
+    vecdb::VectorEngine engine(128);
+
+    // Insert a few dummy vectors
+    // vector 1 (1 on the first dim , 0 everywhere else)
+    std::vector<float> vec1(128, 0.0f);
+    vec1[0] = 1.0f;
+    // vector 2 (1 on the first dim , 0 everywhere else)
+    std::vector<float> vec2(128, 0.0f);  // Vector of 128 twos
+    vec2[1] = 1.0f;
+
+    engine.insert(100, vec1);
+    engine.insert(200, vec2);
+
+    // Save to disk
+    EXPECT_NO_THROW(engine.save(db_path));
+  }  // 'engine' is completely destroyed here, RAM is cleared.
+
+  // Spin up a brand new, empty engine
+  vecdb::VectorEngine loaded_engine(128);
+
+  // Load the binary file from disk
+  EXPECT_NO_THROW(loaded_engine.load(db_path));
+
+  // Verify the state perfectly matches
+  ASSERT_EQ(loaded_engine.size(), 2);
+
+  // Query it to prove the math still works on the loaded data
+  std::vector<float> query(128, 0.0f);
+  query[0] = 1.0f;
+  auto results = loaded_engine.search(query, 2);
+
+  ASSERT_EQ(results.size(), 2);
+
+  // --- DIAGNOSTIC OUTPUT ---
+  // std::cout << "\n[--- ENGINE CONFESSION ---]\n";
+  // std::cout << "Result 0: ID = " << results[0].id
+  //           << " | Distance = " << results[0].distance << "\n";
+  // std::cout << "Result 1: ID = " << results[1].id
+  //           << " | Distance = " << results[1].distance << "\n";
+  // std::cout << "[-------------------------]\n\n";
+  // -------------------------
+
+  EXPECT_EQ(results[0].id, 100);
+  EXPECT_EQ(results[1].id, 200);
+}

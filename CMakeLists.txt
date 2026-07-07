@@ -17,7 +17,7 @@ set(GLOBAL_COMPILER_WARNINGS
 # Apply global build types (Debug vs Release)
 if(CMAKE_BUILD_TYPE MATCHES Debug)
     message(STATUS "Configuring Debug Build with Sanitizers...")
-    set(COMPILER_FLAGS ${GLOBAL_COMPILER_WARNINGS} -g -O0 -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer)
+    set(COMPILER_FLAGS ${GLOBAL_COMPILER_WARNINGS} -g -O0 -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer -march=native) 
     set(LINKER_FLAGS -fsanitize=address -fsanitize=undefined)
 else()
     message(STATUS "Configuring Release Build with Optimizations...")

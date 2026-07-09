@@ -139,3 +139,38 @@ TEST(PersistenceTest, CanSaveAndLoadBinaryDatabase) {
   EXPECT_EQ(results[0].id, 100);
   EXPECT_EQ(results[1].id, 200);
 }
+
+TEST(HnswTest, LayerProbabilityDistribution) {
+  // Spin up an engine with M=16
+  vecdb::VectorEngine engine(128, 16);
+
+  std::vector<int> layer_counts(10, 0);  // track counts for layers 0-9
+  int num_rolls = 10000;
+
+  for (int i = 0; i < num_rolls; ++i) {
+    int layer = engine.generate_random_layer();
+    // Cap it at 9 just so our array doesn't overflow if we roll a crazy outlier
+    if (layer < 10) {
+      layer_counts[static_cast<size_t>(layer)]++;
+    }
+  }
+
+  std::cout << "\n[--- HNSW LAYER DISTRIBUTION (" << num_rolls
+            << " nodes) ---]\n";
+  for (size_t i = 0; i < 5; i++) {
+    double percentage =
+        (static_cast<double>(layer_counts[i]) / num_rolls) * 100.0;
+    std::cout << "Layer " << i << ": " << layer_counts[i] << " nodes ("
+              << percentage << "%)\n";
+  }
+  std::cout << "[-------------------------------------------------]\n\n";
+
+  // Verify exponential decay: Layer 0 should be strictly greater than Layer 1,
+  // etc.
+  EXPECT_GT(layer_counts[0], layer_counts[1]);
+  EXPECT_GT(layer_counts[1], layer_counts[2]);
+
+  // For M=16, the math dictates Layer 0 should contain roughly 70-75% of all
+  // nodes
+  EXPECT_GT(layer_counts[0], 7000);
+}

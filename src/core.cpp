@@ -5,11 +5,34 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>  // for numeric_limits
 #include <queue>
 #include <stdexcept>
 
 namespace vecdb {
-VectorEngine::VectorEngine(size_t dimensions) : dimensions_(dimensions) {}
+VectorEngine::VectorEngine(size_t dimensions, size_t M)
+    : dimensions_(dimensions),
+      M_(M),
+      M_max0_(M * 2),
+      max_layer_(-1),  //-1 -> graph is empty
+      ep_index_(-1),
+      generator_(42)  // fixed seed
+{
+  // The HNSW paper defines the optimal multiplier to scale the exponential
+  // decay
+  mult_ = 1.0 / std::log(static_cast<double>(M_));
+}
+// dice roll
+int VectorEngine::generate_random_layer() {
+  std::uniform_real_distribution<double> distribution(0.0, 1.0);
+  double r = distribution(generator_);
+
+  // prevent taking natural log to abs zero
+  if (r == 0.0) r = std::numeric_limits<double>::min();
+
+  // Formula: floor(-ln(uniform_random) * multiplier)
+  return static_cast<int>(-std::log(r) * mult_);
+}
 
 void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
   if (data.size() != dimensions_) {

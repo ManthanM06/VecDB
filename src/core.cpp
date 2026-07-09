@@ -8,6 +8,7 @@
 #include <limits>  // for numeric_limits
 #include <queue>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace vecdb {
 VectorEngine::VectorEngine(size_t dimensions, size_t M)
@@ -54,11 +55,79 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
     magnitude = 1.0f;
   }
 
-  ids_.push_back(id);
-
   // divide every elemet by the magnitude and append to flat array
+  std::vector<float> norm_data;
+  norm_data.reserve(dimensions_);
   for (float val : data) {
-    raw_data_.push_back(val / magnitude);
+    norm_data.push_back(val / magnitude);
+  }
+
+  ids_.push_back(id);
+  raw_data_.insert(raw_data_.end(), norm_data.begin(), norm_data.end());
+
+  // graph prep
+  int level = generate_random_layer();
+
+  // dynamically expand the graph if we encounter a higher ID
+  if (id >= nodes_.size()) {
+    nodes_.resize(id + 1);
+  }
+  nodes_[id].neighbors.resize(static_cast<size_t>(level + 1));
+
+  // First node inserted becomes the "King" of the empty graph
+  if (max_layer_ == -1) {
+    max_layer_ = level;
+    ep_index_ = static_cast<int>(id);
+    return;
+  }
+
+  // HNSW ROUNTING
+  VectorId curr_node = static_cast<VectorId>(ep_index_);
+
+  // Phase 1 : Drop (Descend layers without making connections)
+  for (int lc = max_layer_; lc > level; --lc) {
+    size_t max_connections = (lc == 0) ? M_max0_ : M_;
+    size_t ef_construction = 32;
+
+    auto W = search_layer(norm_data, curr_node, ef_construction, lc);
+
+    // Extract from Max-heap (they come out worst to best)
+    std::vector<SearchResult> neighbors;
+    neighbors.reserve(W.size());
+    while (!W.empty()) {
+      neighbors.push_back(W.top());
+      W.pop();
+    }
+
+    // The absolute closest node becomes our entry point for the next layer down
+    curr_node = neighbors.back().id;
+
+    // wire the connection
+    size_t num_to_connect = std::min(neighbors.size(), max_connections);
+
+    // Iterate backwords (from closest to furthest)
+    for (auto it = neighbors.rbegin();
+         it != neighbors.rend() && num_to_connect > 0; ++it, --num_to_connect) {
+      VectorId neighbors_id = it->id;
+
+      // Bidirectional wiring
+      nodes_[id].neighbors[static_cast<size_t>(lc)].push_back(neighbors_id);
+      nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].push_back(id);
+
+      // Naive Pruning : Prevent infinite edge growth for existing neighbors
+      if (nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].size() >
+          max_connections) {
+        nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].erase(
+            nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].begin());
+      }
+    }
+  }
+
+  // If this new node rolled the highest level ever seen, it becomes the new
+  // King
+  if (level > max_layer_) {
+    max_layer_ = level;
+    ep_index_ = static_cast<int>(id);
   }
 }
 
@@ -100,37 +169,47 @@ std::vector<SearchResult> VectorEngine::search(const std::vector<float>& query,
 
   if (ids_.empty() || k == 0) return {};
 
-  auto cmp = [](const SearchResult& left, const SearchResult& right) {
-    return left.distance < right.distance;
-  };
-  std::priority_queue<SearchResult, std::vector<SearchResult>, decltype(cmp)>
-      max_heap(cmp);
+  // Normalize the user's query vector
+  float sq_sum = 0.0f;
+  for (float val : query) {
+    sq_sum += val * val;
+  }
+  float magnitude = std::sqrt(sq_sum);
+  if (magnitude == 0.0f) magnitude = 1.0f;
 
-  size_t num_vectors = ids_.size();
-  const float* query_ptr = query.data();
-
-  for (size_t i = 0; i < num_vectors; ++i) {
-    const float* vec_ptr = &raw_data_[i * dimensions_];
-
-    float dot_product = simd_dot_product(vec_ptr, query_ptr, dimensions_);
-
-    float distance = 1.0f - dot_product;
-
-    if (max_heap.size() < k) {
-      max_heap.push({ids_[i], distance});
-    } else if (distance < max_heap.top().distance) {
-      max_heap.pop();
-      max_heap.push({ids_[i], distance});
-    }
+  std::vector<float> norm_query;
+  norm_query.reserve(dimensions_);
+  for (float val : query) {
+    norm_query.push_back(val / magnitude);
   }
 
+  VectorId curr_node = static_cast<VectorId>(ep_index_);
+
+  // 1. Highway navigation
+  for (int lc = max_layer_; lc > 0; --lc) {
+    auto W = search_layer(norm_query, curr_node, 1, lc);
+    curr_node = W.top().id;
+  }
+
+  // 2. Driveway navigation: Seach layer 0 for the top K res
+  //  'ef_search' controls the accuracy vs speed tradeoff
+  size_t ef_search = std::max(k, static_cast<size_t>(64));
+  auto W = search_layer(norm_query, curr_node, ef_search, 0);
+
+  // Extract and format the final res
   std::vector<SearchResult> results;
-  results.reserve(max_heap.size());
-  while (!max_heap.empty()) {
-    results.push_back(max_heap.top());
-    max_heap.pop();
+  while (!W.empty()) {
+    results.push_back(W.top());
+    W.pop();
   }
+
+  // Reverse bcuz Max-heap pops worst first
   std::reverse(results.begin(), results.end());
+
+  // trim down to exactly K res
+  if (results.size() > k) {
+    results.resize(k);
+  }
   return results;
 }
 // A unique identifier: "VEC1" encoded as a 32-bit hex integer
@@ -217,5 +296,70 @@ void VectorEngine::load(const std::string& file_path) {
     file.read(reinterpret_cast<char*>(raw_data_.data()),
               static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
   }
+}
+
+std::priority_queue<SearchResult, std::vector<SearchResult>, ComapreByDistance>
+VectorEngine::search_layer(const std::vector<float>& query, VectorId ep,
+                           size_t ef, int layer) const {
+  // track where we have been
+  std::unordered_set<VectorId> visited;
+  visited.insert(ep);
+
+  // Min-heap for nodes we need to evaluate
+  std::priority_queue<SearchResult, std::vector<SearchResult>,
+                      ComapreByDistanceMin>
+      candidates;
+
+  // Max-heap for the best results we have found so fat
+  std::priority_queue<SearchResult, std::vector<SearchResult>,
+                      ComapreByDistance>
+      top_results;
+
+  // calc distance for the entry point
+  const float* query_ptr = query.data();
+  const float* ep_ptr = &raw_data_[ep * dimensions_];
+  float ep_dist = 1.0f - simd_dot_product(ep_ptr, query_ptr, dimensions_);
+
+  candidates.push({ep, ep_dist});
+  top_results.push({ep, ep_dist});
+
+  while (!candidates.empty()) {
+    SearchResult current = candidates.top();
+    candidates.pop();
+
+    // GREEDY STOP CONDITION:
+    // If our best candidate to explore is further away than the WORST result
+    // in our top_results heap, it means we have hit a local minimum. Stop
+    // searching.
+    if (current.distance > top_results.top().distance) {
+      break;
+    }
+
+    // Look at all the neighbors of this current node on this specific layer
+    for (VectorId neighbor :
+         nodes_[current.id].neighbors[static_cast<size_t>(layer)]) {
+      if (visited.find(neighbor) == visited.end()) {
+        visited.insert(neighbor);
+
+        const float* neighbor_ptr = &raw_data_[neighbor * dimensions_];
+        float dist =
+            1.0f - simd_dot_product(neighbor_ptr, query_ptr, dimensions_);
+
+        // If our top_results aren't full yet, OR this neighbor is better than
+        // our worst result
+        if (top_results.size() < ef || dist < top_results.top().distance) {
+          candidates.push({neighbor, dist});
+          top_results.push({neighbor, dist});
+
+          // Kick out the worst res if we exceed out "ef" limit
+
+          if (top_results.size() > ef) {
+            top_results.pop();
+          }
+        }
+      }
+    }
+  }
+  return top_results;
 }
 }  // namespace vecdb

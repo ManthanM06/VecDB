@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <queue>
 #include <random>     //for HNSW propbability generation
 #include <stdexcept>  // for std::runtime_error
 #include <string>
 #include <vector>
+
 namespace vecdb {
 
 using VectorId = uint32_t;
@@ -23,6 +25,20 @@ class DatabaseError : public std::runtime_error {
 struct HnswNode {
   // list of connected VectorIds on that specific layer
   std::vector<std::vector<VectorId>> neighbors;
+};
+
+struct ComapreByDistance {
+  // Max-heap: keeps the LARGEST distance at the top
+  bool operator()(const SearchResult& a, const SearchResult& b) const {
+    return a.distance < b.distance;
+  }
+};
+
+struct ComapreByDistanceMin {
+  // Min-heap: keeps the SMALLEST distance at the top
+  bool operator()(const SearchResult& a, const SearchResult& b) const {
+    return a.distance > b.distance;
+  }
 };
 
 class VectorEngine {
@@ -60,6 +76,12 @@ class VectorEngine {
 
   std::vector<HnswNode> nodes_;  // adj list
   std::mt19937 generator_;       // for dice roll
+
+  // Crawls a single layer of the graph and returns the 'ef' closest neighbors
+  std::priority_queue<SearchResult, std::vector<SearchResult>,
+                      ComapreByDistance>
+  search_layer(const std::vector<float>& query, VectorId ep, size_t ef,
+               int layer) const;
 };
 
 }  // namespace vecdb

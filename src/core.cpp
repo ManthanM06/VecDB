@@ -11,6 +11,10 @@
 #include <unordered_set>
 
 namespace vecdb {
+
+// Forward declaration: defined after insert() in this file
+inline float simd_dot_product(const float* a, const float* b, size_t size);
+
 VectorEngine::VectorEngine(size_t dimensions, size_t M)
     : dimensions_(dimensions),
       M_(M),
@@ -63,6 +67,7 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
   }
 
   ids_.push_back(id);
+  id_to_index_[id] = ids_.size() - 1;  // record sequential slot before append
   raw_data_.insert(raw_data_.end(), norm_data.begin(), norm_data.end());
 
   // graph prep
@@ -81,17 +86,31 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
     return;
   }
 
-  // HNSW ROUNTING
+  // HNSW ROUTING
   VectorId curr_node = static_cast<VectorId>(ep_index_);
 
-  // Phase 1 : Drop (Descend layers without making connections)
+  // -----------------------------------------------------------------------
+  // Phase 1: GREEDY DROP — descend from max_layer down to level+1.
+  // Purpose: find the best entry point for Phase 2. NO edges are wired here.
+  // -----------------------------------------------------------------------
   for (int lc = max_layer_; lc > level; --lc) {
+    auto W = search_layer(norm_data, curr_node, 1, lc);
+    // The closest node found becomes the entry point for the next layer
+    curr_node = W.top().id;
+  }
+
+  // -----------------------------------------------------------------------
+  // Phase 2: CONNECT — for every layer from min(level, max_layer_) down to 0,
+  // search with ef_construction candidates and wire bidirectional edges.
+  // -----------------------------------------------------------------------
+  int connect_from = std::min(max_layer_, level);
+  for (int lc = connect_from; lc >= 0; --lc) {
     size_t max_connections = (lc == 0) ? M_max0_ : M_;
-    size_t ef_construction = 32;
+    size_t ef_construction = 128;  // larger pool = better graph quality
 
     auto W = search_layer(norm_data, curr_node, ef_construction, lc);
 
-    // Extract from Max-heap (they come out worst to best)
+    // Extract from Max-heap (they come out worst-first, best is at .back())
     std::vector<SearchResult> neighbors;
     neighbors.reserve(W.size());
     while (!W.empty()) {
@@ -100,31 +119,54 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
     }
 
     // The absolute closest node becomes our entry point for the next layer down
-    curr_node = neighbors.back().id;
+    if (!neighbors.empty()) {
+      curr_node = neighbors.back().id;
+    }
 
-    // wire the connection
+    // Wire edges: iterate from closest (back) to furthest (front)
     size_t num_to_connect = std::min(neighbors.size(), max_connections);
-
-    // Iterate backwords (from closest to furthest)
     for (auto it = neighbors.rbegin();
          it != neighbors.rend() && num_to_connect > 0; ++it, --num_to_connect) {
       VectorId neighbors_id = it->id;
+
+      // Dynamically scale layers if an edge-case mismatch occurs
+      if (static_cast<size_t>(lc) >= nodes_[id].neighbors.size()) {
+        nodes_[id].neighbors.resize(static_cast<size_t>(lc + 1));
+      }
+      if (static_cast<size_t>(lc) >= nodes_[neighbors_id].neighbors.size()) {
+        nodes_[neighbors_id].neighbors.resize(static_cast<size_t>(lc + 1));
+      }
 
       // Bidirectional wiring
       nodes_[id].neighbors[static_cast<size_t>(lc)].push_back(neighbors_id);
       nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].push_back(id);
 
-      // Naive Pruning : Prevent infinite edge growth for existing neighbors
-      if (nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].size() >
-          max_connections) {
-        nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].erase(
-            nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)].begin());
+      // Correct Pruning: if the neighbor now has too many connections, remove
+      // the WORST (most distant) one — not the oldest (begin()). This preserves
+      // graph navigability by keeping only the closest M connections.
+      auto& nbr_list = nodes_[neighbors_id].neighbors[static_cast<size_t>(lc)];
+      if (nbr_list.size() > max_connections) {
+        // Find the neighbour with the highest distance from neighbors_id
+        size_t worst_pos = 0;
+        float worst_dist = 0.0f;
+        size_t nbr_idx = id_to_index_.at(neighbors_id);
+        const float* nbr_ptr = &raw_data_[nbr_idx * dimensions_];
+        for (size_t ni = 0; ni < nbr_list.size(); ++ni) {
+          size_t cand_idx = id_to_index_.at(nbr_list[ni]);
+          const float* cand_ptr = &raw_data_[cand_idx * dimensions_];
+          float d = 1.0f - simd_dot_product(nbr_ptr, cand_ptr, dimensions_);
+          if (d > worst_dist) {
+            worst_dist = d;
+            worst_pos = ni;
+          }
+        }
+        nbr_list.erase(nbr_list.begin() + static_cast<std::ptrdiff_t>(worst_pos));
       }
     }
   }
 
   // If this new node rolled the highest level ever seen, it becomes the new
-  // King
+  // entry point ("King" of the graph)
   if (level > max_layer_) {
     max_layer_ = level;
     ep_index_ = static_cast<int>(id);
@@ -193,7 +235,7 @@ std::vector<SearchResult> VectorEngine::search(const std::vector<float>& query,
 
   // 2. Driveway navigation: Seach layer 0 for the top K res
   //  'ef_search' controls the accuracy vs speed tradeoff
-  size_t ef_search = std::max(k, static_cast<size_t>(64));
+  size_t ef_search = std::max(k, static_cast<size_t>(200));
   auto W = search_layer(norm_query, curr_node, ef_search, 0);
 
   // Extract and format the final res
@@ -284,17 +326,31 @@ void VectorEngine::load(const std::string& file_path) {
   // By resizing before reading, we guarantee contiguous memory and avoid
   // the CPU wasting time dynamically expanding the vectors during the load.
 
-  ids_.resize(num_vectors);
-  raw_data_.resize(num_vectors * dimensions_);
+  // Temporarily stage the raw data so we can re-insert to rebuild the graph.
+  std::vector<VectorId> loaded_ids(num_vectors);
+  std::vector<float> loaded_data(num_vectors * dimensions_);
 
   // 4. Blast the bytes straight from the SSD into the pre-allocated RAM
   if (num_vectors > 0) {
     // Read expects a char*, not a const char*, because it has to modify the
     // memory
-    file.read(reinterpret_cast<char*>(ids_.data()),
+    file.read(reinterpret_cast<char*>(loaded_ids.data()),
               static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
-    file.read(reinterpret_cast<char*>(raw_data_.data()),
-              static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
+    file.read(reinterpret_cast<char*>(loaded_data.data()),
+              static_cast<std::streamsize>(loaded_data.size() * sizeof(float)));
+  }
+
+  // 5. Re-insert all loaded vectors to rebuild the HNSW graph topology.
+  // The graph (nodes_, ep_index_, max_layer_) is NOT persisted to disk, so
+  // we must reconstruct it by replaying all inserts. The raw_data_ is stored
+  // PRE-normalized, so we wrap each vector's slice and pass it directly.
+  // NOTE: insert() will re-normalize, but since the stored vectors are already
+  // unit-length, the normalization is a no-op (magnitude ≈ 1.0).
+  for (size_t i = 0; i < num_vectors; ++i) {
+    VectorId vid = loaded_ids[i];
+    std::vector<float> vec(loaded_data.begin() + static_cast<std::ptrdiff_t>(i * dimensions_),
+                           loaded_data.begin() + static_cast<std::ptrdiff_t>((i + 1) * dimensions_));
+    insert(vid, vec);
   }
 }
 
@@ -317,7 +373,8 @@ VectorEngine::search_layer(const std::vector<float>& query, VectorId ep,
 
   // calc distance for the entry point
   const float* query_ptr = query.data();
-  const float* ep_ptr = &raw_data_[ep * dimensions_];
+  size_t ep_idx = id_to_index_.at(ep);
+  const float* ep_ptr = &raw_data_[ep_idx * dimensions_];
   float ep_dist = 1.0f - simd_dot_product(ep_ptr, query_ptr, dimensions_);
 
   candidates.push({ep, ep_dist});
@@ -335,26 +392,28 @@ VectorEngine::search_layer(const std::vector<float>& query, VectorId ep,
       break;
     }
 
-    // Look at all the neighbors of this current node on this specific layer
-    for (VectorId neighbor :
-         nodes_[current.id].neighbors[static_cast<size_t>(layer)]) {
-      if (visited.find(neighbor) == visited.end()) {
-        visited.insert(neighbor);
+    // Only look at neighbors if this node actually has records for this layer
+    if (static_cast<size_t>(layer) < nodes_[current.id].neighbors.size()) {
+      for (VectorId neighbor :
+           nodes_[current.id].neighbors[static_cast<size_t>(layer)]) {
+        if (visited.find(neighbor) == visited.end()) {
+          visited.insert(neighbor);
 
-        const float* neighbor_ptr = &raw_data_[neighbor * dimensions_];
-        float dist =
-            1.0f - simd_dot_product(neighbor_ptr, query_ptr, dimensions_);
+          const float* neighbor_ptr = &raw_data_[id_to_index_.at(neighbor) * dimensions_];
+          float dist =
+              1.0f - simd_dot_product(neighbor_ptr, query_ptr, dimensions_);
 
-        // If our top_results aren't full yet, OR this neighbor is better than
-        // our worst result
-        if (top_results.size() < ef || dist < top_results.top().distance) {
-          candidates.push({neighbor, dist});
-          top_results.push({neighbor, dist});
+          // If our top_results aren't full yet, OR this neighbor is better than
+          // our worst result
+          if (top_results.size() < ef || dist < top_results.top().distance) {
+            candidates.push({neighbor, dist});
+            top_results.push({neighbor, dist});
 
-          // Kick out the worst res if we exceed out "ef" limit
+            // Kick out the worst res if we exceed out "ef" limit
 
-          if (top_results.size() > ef) {
-            top_results.pop();
+            if (top_results.size() > ef) {
+              top_results.pop();
+            }
           }
         }
       }

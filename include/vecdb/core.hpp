@@ -5,6 +5,7 @@
 #include <random>     //for HNSW propbability generation
 #include <stdexcept>  // for std::runtime_error
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vecdb {
@@ -65,6 +66,11 @@ class VectorEngine {
   // Structure of Arrays (SoA) Flat Layout
   std::vector<VectorId> ids_;
   std::vector<float> raw_data_;  // A single massive 1D array of floats
+
+  // Maps an external VectorId to its sequential insertion index in raw_data_.
+  // This decouples the logical ID from the physical storage slot, allowing
+  // non-sequential IDs (e.g. 100, 200) to be inserted safely.
+  std::unordered_map<VectorId, size_t> id_to_index_;
 
   // HNSW graph state
   size_t M_;       // max connection a node can have per layer

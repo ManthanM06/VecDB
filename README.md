@@ -8,7 +8,6 @@ SIMD-accelerated · HNSW-indexed · Thread-safe · REST API · RAG-ready
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![CMake](https://img.shields.io/badge/CMake-3.24%2B-green.svg)](https://cmake.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 

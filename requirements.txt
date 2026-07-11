@@ -1,0 +1,5 @@
+requests>=2.31.0
+sentence-transformers>=2.7.0
+streamlit>=1.35.0
+ollama>=0.2.0
+PyPDF2>=3.0.0

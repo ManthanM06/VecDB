@@ -39,6 +39,13 @@ compile_commands.json
 /.idea/
 .clang-tidy
 
-.venv
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime-generated artifacts (re-created by running the tools)
 build_cmds.txt
 *.vec
+chunks.json

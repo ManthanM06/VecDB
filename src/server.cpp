@@ -6,8 +6,8 @@
 
 using json = nlohmann::json;
 
-// Global database instance
-vecdb::VectorEngine db(128, 16); 
+// Global database instance — 384 dimensions to match all-MiniLM-L6-v2 embeddings
+vecdb::VectorEngine db(384, 16);
 const std::string DB_FILE = "production_database.vec";
 
 int main() {

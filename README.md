@@ -75,17 +75,18 @@ An `id_to_index_` hash map decouples external `VectorId` values from physical st
 
 The **Hierarchical Navigable Small World** index provides sub-linear approximate nearest-neighbor search:
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| M | 16 | Max edges per node per layer |
-| M_max0 | 32 | Max edges in layer 0 |
-| ef_construction | 128 | Candidate pool during build |
-| ef_search | 200 | Candidate pool during query |
-| Recall@10 | ~92% | On 10K random 128-dim vectors |
+| Parameter       | Value | Notes                         |
+| --------------- | ----- | ----------------------------- |
+| M               | 16    | Max edges per node per layer  |
+| M_max0          | 32    | Max edges in layer 0          |
+| ef_construction | 128   | Candidate pool during build   |
+| ef_search       | 200   | Candidate pool during query   |
+| Recall@10       | ~92%  | On 10K random 128-dim vectors |
 
 Insertion uses the correct two-phase algorithm:
+
 1. **Greedy Drop** — descend from `max_layer` to `level+1` updating entry point, no edge wiring
-2. **Connect** — search + wire bidirectional edges for all layers ≤ node's level, prune by removing the *worst* (most distant) neighbor when limit exceeded
+2. **Connect** — search + wire bidirectional edges for all layers ≤ node's level, prune by removing the _worst_ (most distant) neighbor when limit exceeded
 
 ### Distance metric
 
@@ -164,14 +165,15 @@ cmake --build build-release
 
 **Test suite (4 tests):**
 
-| Test | What it verifies |
-|------|-----------------|
-| `GroundTruthTest.CanLoadAndVerifyJsonData` | JSON ground truth file structure |
+| Test                                           | What it verifies                           |
+| ---------------------------------------------- | ------------------------------------------ |
+| `GroundTruthTest.CanLoadAndVerifyJsonData`     | JSON ground truth file structure           |
 | `EngineTest.ExactBruteForceMatchesGroundTruth` | HNSW Recall@10 ≥ 90% vs Python brute force |
-| `PersistenceTest.CanSaveAndLoadBinaryDatabase` | Full binary round-trip save/load |
-| `HnswTest.LayerProbabilityDistribution` | Exponential layer distribution |
+| `PersistenceTest.CanSaveAndLoadBinaryDatabase` | Full binary round-trip save/load           |
+| `HnswTest.LayerProbabilityDistribution`        | Exponential layer distribution             |
 
 Expected output:
+
 ```
 [  PASSED  ] 4 tests.
 
@@ -218,16 +220,21 @@ The server is configured for **384 dimensions** to match the `all-MiniLM-L6-v2` 
 ### Endpoints
 
 #### `POST /insert`
+
 ```json
 { "id": 42, "vector": [0.12, -0.34, ..., 0.56] }
 ```
+
 Response: `{"status": "success"}`
 
 #### `POST /search`
+
 ```json
 { "k": 5, "vector": [0.12, -0.34, ..., 0.56] }
 ```
+
 Response:
+
 ```json
 [
   {"id": 7832, "distance": 0.142},
@@ -237,6 +244,7 @@ Response:
 ```
 
 #### `POST /save`
+
 Flushes the in-memory database to `production_database.vec`. The server reloads this file automatically on next startup.
 
 ---
@@ -263,144 +271,25 @@ Database saved successfully to production_database.vec
 
 ---
 
-## RAG Pipeline (Phase 6)
-
-Connect VecDB to a real embedding model and LLM for Retrieval-Augmented Generation.
-
-### Setup
-
-```bash
-# Create and activate virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### Step 1 — Start the C++ server
-
-```bash
-./build-release/vecdb_server
-```
-
-### Step 2 — Ingest your documents
-
-Drop any `.txt`, `.md`, or `.pdf` files into `docs/` and run:
-
-```bash
-python3 ingest_docs.py docs/
-```
-
-This will:
-1. Split each document into 300-word overlapping chunks
-2. Embed every chunk using `all-MiniLM-L6-v2` (384-dim, runs locally, no GPU needed)
-3. Stream all chunk vectors into VecDB via the Python SDK
-4. Save a `chunks.json` sidecar mapping vector IDs to text
-
-```
-[✓] Connected to VecDB at http://localhost:8080
-[✓] Model loaded  |  output dim = 384
-[...] Found 2 document(s)
-  hnsw_algorithm.md    →  7 chunks
-  vecdb_architecture.md → 6 chunks
-[✓] Total chunks: 13
-  Done: 13/13 vectors inserted in 0.06s (233 vec/s)
-[✓] Database saved successfully.
-✅  Ingestion complete!
-```
-
-### Step 3 — Launch the chat UI
-
-```bash
-streamlit run rag_chat.py
-```
-
-Open `http://localhost:8501` in your browser.
-
-> **LLM:** Install [Ollama](https://ollama.com) and run `ollama pull llama3.2` for local inference. Or set `USE_OLLAMA = False` in `rag_chat.py` to use the bundled `flan-t5-base` HuggingFace fallback (no GPU needed).
-
-### Python SDK
-
-```python
-from vecdb_client import VecDBClient, InsertItem
-
-client = VecDBClient("http://localhost:8080")
-
-# Single insert
-client.insert(42, [0.1, 0.2, ..., 0.9])  # 384 floats
-
-# Batch insert (concurrent)
-items = [InsertItem(id=i, vector=my_vectors[i]) for i in range(10000)]
-client.batch_insert(items, workers=32)
-
-# Search
-results = client.search(query_vector, k=5)
-for r in results:
-    print(f"ID: {r.id}  Distance: {r.distance:.4f}")
-
-# Persist
-client.save()
-```
-
----
-
-## Binary File Format (`.vec`)
-
-The persistence format stores the complete database state — including the HNSW graph topology — so the server restores in milliseconds without re-indexing:
-
-```
-[4 bytes]  Magic number: 0x31434556 ("VEC1")
-[8 bytes]  Vector count
-[8 bytes]  Dimensions
-[N×4 bytes] VectorId array
-[N×D×4 bytes] Float32 vector data (L2-normalized)
-[4 bytes]  max_layer (HNSW state)
-[4 bytes]  ep_index (entry point)
-[variable] id_to_index map
-[variable] Full HNSW adjacency list (layers × neighbors per node)
-```
-
----
-
-## Roadmap
-
-| Phase | Status | Description |
-|-------|--------|-------------|
-| 1 | ✅ Done | Ground truth generation & test harness |
-| 2 | ✅ Done | Core structures + brute-force search |
-| 3 | ✅ Done | AVX2 SIMD distance computation |
-| 4 | ✅ Done | Binary persistence with full graph serialization |
-| 5 | ✅ Done | HNSW index with correct two-phase insertion |
-| 6 | ✅ Done | Python RAG pipeline (SDK, ingestion, Streamlit chat) |
-| 7 | 🔲 Next | Metadata filtering, vector deletion (tombstoning), async snapshots |
-| 8 | 🔲 Future | Write-Ahead Log (WAL), dynamic memory pooling, distributed sharding |
-
----
-
 ## Dependencies
 
 All C++ dependencies are fetched automatically by CMake on first build:
 
-| Library | Version | Use |
-|---------|---------|-----|
-| [GoogleTest](https://github.com/google/googletest) | v1.14.0 | Unit testing |
-| [Google Benchmark](https://github.com/google/benchmark) | v1.8.3 | Performance benchmarks |
-| [nlohmann/json](https://github.com/nlohmann/json) | v3.11.3 | JSON parsing |
-| [cpp-httplib](https://github.com/yhirose/cpp-httplib) | v0.15.3 | HTTP server |
+| Library                                                 | Version | Use                    |
+| ------------------------------------------------------- | ------- | ---------------------- |
+| [GoogleTest](https://github.com/google/googletest)      | v1.14.0 | Unit testing           |
+| [Google Benchmark](https://github.com/google/benchmark) | v1.8.3  | Performance benchmarks |
+| [nlohmann/json](https://github.com/nlohmann/json)       | v3.11.3 | JSON parsing           |
+| [cpp-httplib](https://github.com/yhirose/cpp-httplib)   | v0.15.3 | HTTP server            |
 
 Python dependencies (install via `pip install -r requirements.txt`):
 
-| Package | Use |
-|---------|-----|
+| Package                 | Use                                        |
+| ----------------------- | ------------------------------------------ |
 | `sentence-transformers` | Local embedding model (`all-MiniLM-L6-v2`) |
-| `streamlit` | RAG chat UI |
-| `ollama` | Local LLM inference |
-| `PyPDF2` | PDF document ingestion |
-| `requests` | HTTP client |
+| `streamlit`             | RAG chat UI                                |
+| `ollama`                | Local LLM inference                        |
+| `PyPDF2`                | PDF document ingestion                     |
+| `requests`              | HTTP client                                |
 
 ---
-
-## License
-
-MIT License — see [LICENSE](LICENSE).

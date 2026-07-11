@@ -6,7 +6,9 @@
 #include <cmath>
 #include <fstream>
 #include <limits>  // for numeric_limits
+#include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -44,8 +46,8 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
     throw std::invalid_argument(
         "Vector dimensions do not match databse dimensiosn.");
   }
-  // L2 normalization
-  //  calc squared sum of all the elements
+  // L2 normalization — done BEFORE locking so we don't hold the lock
+  // while doing pure CPU work on the caller's local data.
   float sq_sum = 0.0f;
   for (float val : data) {
     sq_sum += val * val;
@@ -54,17 +56,20 @@ void VectorEngine::insert(VectorId id, const std::vector<float>& data) {
   // calc magnitude
   float magnitude = std::sqrt(sq_sum);
 
-  // prevent div by 0 if someone enteres an empty vector
+  // prevent div by 0 if someone enters an empty vector
   if (magnitude == 0.0f) {
     magnitude = 1.0f;
   }
 
-  // divide every elemet by the magnitude and append to flat array
+  // divide every element by the magnitude
   std::vector<float> norm_data;
   norm_data.reserve(dimensions_);
   for (float val : data) {
     norm_data.push_back(val / magnitude);
   }
+
+  // Acquire exclusive write lock — everything that touches shared state below
+  std::unique_lock lock(mutex_);
 
   ids_.push_back(id);
   id_to_index_[id] = ids_.size() - 1;  // record sequential slot before append
@@ -209,6 +214,9 @@ std::vector<SearchResult> VectorEngine::search(const std::vector<float>& query,
         "Query dimensions do not match databse dimensions.");
   }
 
+  // Acquire shared lock — multiple searches can run concurrently
+  std::shared_lock lock(mutex_);
+
   if (ids_.empty() || k == 0) return {};
 
   // Normalize the user's query vector
@@ -258,101 +266,151 @@ std::vector<SearchResult> VectorEngine::search(const std::vector<float>& query,
 const uint32_t VECDB_MAGIC_NUMBER = 0x31434556;
 
 void VectorEngine::save(const std::string& file_path) const {
-  std::ofstream file(file_path, std::ios::binary);
-  if (!file) {
-    throw DatabaseError("Failed to open file for writing: " + file_path);
-  }
-  // 1. Write the Header (Magic Number, Vector Count, Dimensions)
-  file.write(reinterpret_cast<const char*>(&VECDB_MAGIC_NUMBER),
-             sizeof(uint32_t));
+    // Shared lock — reading is safe to do concurrently with other readers
+    std::shared_lock lock(mutex_);
 
-  size_t num_vectors = ids_.size();
-  file.write(reinterpret_cast<const char*>(&num_vectors), sizeof(size_t));
-  file.write(reinterpret_cast<const char*>(&dimensions_), sizeof(size_t));
+    std::ofstream file(file_path, std::ios::binary);
+    if (!file) {
+        throw DatabaseError("Failed to open file for writing: " + file_path);
+    }
+    
+    // 1. Write the Header (Magic Number, Vector Count, Dimensions)
+    file.write(reinterpret_cast<const char*>(&VECDB_MAGIC_NUMBER), sizeof(uint32_t));
 
-  // 2. Dump the IDs array directly from RAM to SSD
-  if (num_vectors > 0) {
-    file.write(reinterpret_cast<const char*>(ids_.data()),
-               static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
-  }
+    size_t num_vectors = ids_.size();
+    file.write(reinterpret_cast<const char*>(&num_vectors), sizeof(size_t));
+    file.write(reinterpret_cast<const char*>(&dimensions_), sizeof(size_t));
 
-  // 3. Dump the float array directly from RAM to SSD
-  if (!raw_data_.empty()) {
-    file.write(reinterpret_cast<const char*>(raw_data_.data()),
-               static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
-  }
+    // 2. Dump the IDs array directly from RAM to SSD
+    if (num_vectors > 0) {
+        file.write(reinterpret_cast<const char*>(ids_.data()),
+                   static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
+    }
 
-  // Verify the write stream didn't fail midway
-  if (!file.good()) {
-    throw DatabaseError("An OS error occurred while writing data to disk.");
-  }
+    // 3. Dump the float array directly from RAM to SSD
+    if (!raw_data_.empty()) {
+        file.write(reinterpret_cast<const char*>(raw_data_.data()),
+                   static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
+    }
+
+    // 4. Save Graph State Metadata
+    file.write(reinterpret_cast<const char*>(&max_layer_), sizeof(int));
+    file.write(reinterpret_cast<const char*>(&ep_index_), sizeof(int));
+
+    // 5. Save the id_to_index_ map
+    size_t map_size = id_to_index_.size();
+    file.write(reinterpret_cast<const char*>(&map_size), sizeof(size_t));
+    for (const auto& [vid, idx] : id_to_index_) {
+        file.write(reinterpret_cast<const char*>(&vid), sizeof(VectorId));
+        file.write(reinterpret_cast<const char*>(&idx), sizeof(size_t));
+    }
+
+    // 6. Save the HNSW Graph topology (nodes_)
+    size_t nodes_size = nodes_.size();
+    file.write(reinterpret_cast<const char*>(&nodes_size), sizeof(size_t));
+    for (const auto& node : nodes_) {
+        size_t num_layers = node.neighbors.size();
+        file.write(reinterpret_cast<const char*>(&num_layers), sizeof(size_t));
+        
+        for (const auto& layer : node.neighbors) {
+            size_t num_neighbors = layer.size();
+            file.write(reinterpret_cast<const char*>(&num_neighbors), sizeof(size_t));
+            if (num_neighbors > 0) {
+                file.write(reinterpret_cast<const char*>(layer.data()), 
+                           static_cast<std::streamsize>(num_neighbors * sizeof(VectorId)));
+            }
+        }
+    }
+
+    // Verify the write stream didn't fail midway
+    if (!file.good()) {
+        throw DatabaseError("An OS error occurred while writing data to disk.");
+    }
 }
 
 void VectorEngine::load(const std::string& file_path) {
-  std::ifstream file(file_path, std::ios::binary);
-  if (!file) {
-    throw DatabaseError("Failed to open file for reading: " + file_path);
-  }
+    // Exclusive lock — we are replacing all engine state
+    std::unique_lock lock(mutex_);
 
-  // 1. Security Check: Verify the Magic Number
-  uint32_t magic = 0;
-  file.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
-  // if (magic != VECDB_MAGIC_NUMBERR) {
-  //   throw DatabaseError(
-  //       "Corrupted or invalid file format. Magic number mismatch");
-  // }
-  if (magic != VECDB_MAGIC_NUMBER) {
-    std::string error_msg = "Magic number mismatch!\n";
-    error_msg += "Expected: " + std::to_string(VECDB_MAGIC_NUMBER) + "\n";
-    error_msg += "Got: " + std::to_string(magic) + "\n";
-    error_msg += "Bytes actually read: " + std::to_string(file.gcount()) + "\n";
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+        throw DatabaseError("Failed to open file for reading: " + file_path);
+    }
 
-    throw DatabaseError(error_msg);
-  }
+    // 1. Security Check: Verify the Magic Number
+    uint32_t magic = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(uint32_t));
+    
+    if (magic != VECDB_MAGIC_NUMBER) {
+        std::string error_msg = "Magic number mismatch!\n";
+        error_msg += "Expected: " + std::to_string(VECDB_MAGIC_NUMBER) + "\n";
+        error_msg += "Got: " + std::to_string(magic) + "\n";
+        error_msg += "Bytes actually read: " + std::to_string(file.gcount()) + "\n";
+        throw DatabaseError(error_msg);
+    }
 
-  // 2. Read Metadata
-  size_t num_vectors = 0;
-  size_t file_dimensions = 0;
-  file.read(reinterpret_cast<char*>(&num_vectors), sizeof(size_t));
-  file.read(reinterpret_cast<char*>(&file_dimensions), sizeof(size_t));
+    // 2. Read Metadata
+    size_t num_vectors = 0;
+    size_t file_dimensions = 0;
+    file.read(reinterpret_cast<char*>(&num_vectors), sizeof(size_t));
+    file.read(reinterpret_cast<char*>(&file_dimensions), sizeof(size_t));
 
-  if (file_dimensions != dimensions_) {
-    throw DatabaseError(
-        "Dimensions mismatch! Engine is configured for a different vector "
-        "size.");
-  }
+    if (file_dimensions != dimensions_) {
+        throw DatabaseError("Dimensions mismatch! Engine is configured for a different vector size.");
+    }
 
-  // 3. The Performance Hack: Pre-allocate all memory instantly
-  // By resizing before reading, we guarantee contiguous memory and avoid
-  // the CPU wasting time dynamically expanding the vectors during the load.
+    // 3. The Performance Hack: Pre-allocate raw storage
+    ids_.resize(num_vectors);
+    raw_data_.resize(num_vectors * dimensions_);
 
-  // Temporarily stage the raw data so we can re-insert to rebuild the graph.
-  std::vector<VectorId> loaded_ids(num_vectors);
-  std::vector<float> loaded_data(num_vectors * dimensions_);
+    // Blast the raw arrays straight from the SSD into RAM
+    if (num_vectors > 0) {
+        file.read(reinterpret_cast<char*>(ids_.data()),
+                  static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
+        file.read(reinterpret_cast<char*>(raw_data_.data()),
+                  static_cast<std::streamsize>(raw_data_.size() * sizeof(float)));
+    }
 
-  // 4. Blast the bytes straight from the SSD into the pre-allocated RAM
-  if (num_vectors > 0) {
-    // Read expects a char*, not a const char*, because it has to modify the
-    // memory
-    file.read(reinterpret_cast<char*>(loaded_ids.data()),
-              static_cast<std::streamsize>(num_vectors * sizeof(VectorId)));
-    file.read(reinterpret_cast<char*>(loaded_data.data()),
-              static_cast<std::streamsize>(loaded_data.size() * sizeof(float)));
-  }
+    // 4. Load Graph State Metadata
+    file.read(reinterpret_cast<char*>(&max_layer_), sizeof(int));
+    file.read(reinterpret_cast<char*>(&ep_index_), sizeof(int));
 
-  // 5. Re-insert all loaded vectors to rebuild the HNSW graph topology.
-  // The graph (nodes_, ep_index_, max_layer_) is NOT persisted to disk, so
-  // we must reconstruct it by replaying all inserts. The raw_data_ is stored
-  // PRE-normalized, so we wrap each vector's slice and pass it directly.
-  // NOTE: insert() will re-normalize, but since the stored vectors are already
-  // unit-length, the normalization is a no-op (magnitude ≈ 1.0).
-  for (size_t i = 0; i < num_vectors; ++i) {
-    VectorId vid = loaded_ids[i];
-    std::vector<float> vec(loaded_data.begin() + static_cast<std::ptrdiff_t>(i * dimensions_),
-                           loaded_data.begin() + static_cast<std::ptrdiff_t>((i + 1) * dimensions_));
-    insert(vid, vec);
-  }
+    // 5. Load the id_to_index_ map
+    size_t map_size = 0;
+    file.read(reinterpret_cast<char*>(&map_size), sizeof(size_t));
+    id_to_index_.clear();
+    id_to_index_.reserve(map_size);
+    for (size_t i = 0; i < map_size; ++i) {
+        VectorId vid;
+        size_t idx;
+        file.read(reinterpret_cast<char*>(&vid), sizeof(VectorId));
+        file.read(reinterpret_cast<char*>(&idx), sizeof(size_t));
+        id_to_index_[vid] = idx;
+    }
+
+    // 6. Load the HNSW Graph topology (nodes_)
+    size_t nodes_size = 0;
+    file.read(reinterpret_cast<char*>(&nodes_size), sizeof(size_t));
+    nodes_.resize(nodes_size);
+    
+    for (size_t i = 0; i < nodes_size; ++i) {
+        size_t num_layers = 0;
+        file.read(reinterpret_cast<char*>(&num_layers), sizeof(size_t));
+        nodes_[i].neighbors.resize(num_layers);
+        
+        for (size_t l = 0; l < num_layers; ++l) {
+            size_t num_neighbors = 0;
+            file.read(reinterpret_cast<char*>(&num_neighbors), sizeof(size_t));
+            if (num_neighbors > 0) {
+                nodes_[i].neighbors[l].resize(num_neighbors);
+                file.read(reinterpret_cast<char*>(nodes_[i].neighbors[l].data()), 
+                          static_cast<std::streamsize>(num_neighbors * sizeof(VectorId)));
+            }
+        }
+    }
 }
+
+
 
 std::priority_queue<SearchResult, std::vector<SearchResult>, ComapreByDistance>
 VectorEngine::search_layer(const std::vector<float>& query, VectorId ep,

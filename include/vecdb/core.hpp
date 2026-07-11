@@ -2,8 +2,9 @@
 
 #include <cstdint>
 #include <queue>
-#include <random>     //for HNSW propbability generation
-#include <stdexcept>  // for std::runtime_error
+#include <random>        // for HNSW probability generation
+#include <shared_mutex>  // for reader-writer thread safety
+#include <stdexcept>     // for std::runtime_error
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,11 +52,14 @@ class VectorEngine {
   std::vector<SearchResult> search(const std::vector<float>& query,
                                    size_t k) const;
 
-  // new persistant methods
+  // Persistence methods
   void save(const std::string& file_path) const;
   void load(const std::string& file_path);
 
-  size_t size() const { return ids_.size(); }
+  size_t size() const {
+    std::shared_lock lock(mutex_);
+    return ids_.size();
+  }
   size_t dimensions() const { return dimensions_; }
 
   int generate_random_layer();
@@ -82,6 +86,10 @@ class VectorEngine {
 
   std::vector<HnswNode> nodes_;  // adj list
   std::mt19937 generator_;       // for dice roll
+
+  // Reader-writer lock: multiple concurrent searches are safe; inserts are
+  // exclusive. mutable so const methods (search, save) can lock it too.
+  mutable std::shared_mutex mutex_;
 
   // Crawls a single layer of the graph and returns the 'ef' closest neighbors
   std::priority_queue<SearchResult, std::vector<SearchResult>,

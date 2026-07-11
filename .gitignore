@@ -41,3 +41,4 @@ compile_commands.json
 
 .venv
 build_cmds.txt
+*.vec

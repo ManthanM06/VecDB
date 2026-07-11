@@ -50,7 +50,27 @@ FetchContent_Declare(
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googlebenchmark)
 
+# cpp-httplib (REST Server)
+FetchContent_Declare(
+    httplib
+    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.15.3.zip
+)
+FetchContent_MakeAvailable(httplib)
+
 # Descend into modular subdirectories
 add_subdirectory(src)
 add_subdirectory(tests)
 add_subdirectory(benchmarks)
+
+# Add the server executable
+add_executable(vecdb_server src/server.cpp)
+
+# Link the core engine and the new networking libraries
+target_link_libraries(vecdb_server PRIVATE 
+    vecdb_core
+    httplib
+    nlohmann_json::nlohmann_json
+)
+
+target_compile_options(vecdb_server PRIVATE ${COMPILER_FLAGS})
+target_link_options(vecdb_server PRIVATE ${LINKER_FLAGS})

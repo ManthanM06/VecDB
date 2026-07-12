@@ -185,10 +185,8 @@ def generate_answer_hf(context: str, question: str) -> str:
     best_chunk = context.split("\n\n---\n\n")[0]
 
     prompt = (
-        f"Read the passage and answer the question. "
-        f"Give a direct, concise answer in 1-3 sentences.\n\n"
-        f"Passage: {best_chunk}\n\n"
-        f"Question: {question}\n\n"
+        f"Based on the following text, answer this question: {question}\n\n"
+        f"Text: {best_chunk}\n\n"
         f"Answer:"
     )
 

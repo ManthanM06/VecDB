@@ -31,8 +31,8 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNKS_FILE = "chunks.json"
 TOP_K       = 5                     # chunks to retrieve per query
 OLLAMA_MODEL      = "llama3.2"      # or "mistral", "phi3", etc.
-USE_OLLAMA        = False            # set False to use a small HF model instead
-HF_FALLBACK_MODEL = "google/flan-t5-base"  # lightweight, no GPU needed
+USE_OLLAMA        = False           # set False to use a small HF model instead
+HF_FALLBACK_MODEL = "google/flan-t5-base"
 
 # ---------------------------------------------------------------------------
 # Page config  (must be first Streamlit call)
@@ -45,7 +45,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Custom CSS — dark, premium feel
+# Custom CSS
 # ---------------------------------------------------------------------------
 st.markdown(
     """
@@ -60,7 +60,7 @@ st.markdown(
         color: white;
         padding: 12px 18px;
         border-radius: 18px 18px 4px 18px;
-        margin: 8px 0;
+        margin: 6px 0 2px 0;
         max-width: 80%;
         margin-left: auto;
         box-shadow: 0 4px 15px rgba(79, 70, 229, 0.3);
@@ -86,11 +86,10 @@ st.markdown(
         font-size: 0.82em;
         color: #94a3b8;
     }
-    .stTextInput > div > div > input {
-        background: #1e2130 !important;
-        color: #e2e8f0 !important;
-        border: 1px solid #2d3748 !important;
-        border-radius: 12px !important;
+    /* shrink action buttons beneath user bubbles */
+    .action-row button {
+        font-size: 0.75em !important;
+        padding: 2px 8px !important;
     }
     </style>
     """,
@@ -98,7 +97,7 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
-# Cached resources  (loaded once per session, survive reruns)
+# Cached resources
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner="Loading embedding model…")
@@ -123,10 +122,8 @@ def load_chunks() -> dict[str, dict]:
 @st.cache_resource(show_spinner="Loading HuggingFace LLM…")
 def load_hf_llm():
     """
-    Load flan-t5-base directly via AutoModel classes.
-    transformers v5 dropped the 'text2text-generation' pipeline task,
-    but the underlying seq2seq model API is unchanged.
-    Returns a (tokenizer, model) tuple cached for the session lifetime.
+    Load flan-t5-base via AutoModel (transformers v5 dropped the
+    'text2text-generation' pipeline task, so we use the model directly).
     """
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
 
@@ -140,33 +137,24 @@ def load_hf_llm():
 # ---------------------------------------------------------------------------
 
 def generate_answer_ollama(context: str, question: str) -> str:
-    """
-    Call the locally running Ollama daemon.
-    The ollama Python package (v0.2+) returns a ChatResponse *object*,
-    not a dict — access fields with dot notation, not subscript.
-    """
     try:
         import ollama  # noqa: PLC0415
 
         prompt = (
-            "You are a precise assistant that answers questions using ONLY "
-            "the provided context. If the answer is not in the context, say "
-            "you don't know — do not make up information.\n\n"
+            "You are a precise assistant. Answer the question using ONLY the "
+            "provided context. If the answer is not in the context, say you "
+            "don't know.\n\n"
             f"Context:\n{context}\n\n"
-            f"Question: {question}\n\n"
-            "Answer:"
+            f"Question: {question}\n\nAnswer:"
         )
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        # FIX: ollama ≥ 0.2 returns a ChatResponse object, not a dict.
-        # Use attribute access instead of dict subscript.
         return response.message.content.strip()
 
     except Exception as exc:
         err = str(exc)
-        # Surface a clean, actionable error instead of raw exception text
         if "connect" in err.lower() or "connection" in err.lower():
             return (
                 "⚠️ **Ollama is not running.**\n\n"
@@ -181,24 +169,47 @@ def generate_answer_ollama(context: str, question: str) -> str:
 
 
 def generate_answer_hf(context: str, question: str) -> str:
-    """Use cached flan-t5-base (tokenizer + model) as LLM."""
+    """
+    Inference with flan-t5-base.
+
+    Prompt strategy:
+    - Use only the single most-relevant chunk (first in retrieved list) to
+      stay well within flan-t5-base's 512-token limit.
+    - Phrase as a direct extractive QA instruction — flan-t5 was trained on
+      tasks like this and handles them better than open-ended generation.
+    - Beam search (num_beams=4) gives more coherent answers than greedy.
+    """
     tokenizer, model = load_hf_llm()
+
+    # Use only the highest-similarity chunk to keep the prompt tight
+    best_chunk = context.split("\n\n---\n\n")[0]
+
     prompt = (
-        f"Answer the following question using only the provided context. "
-        f"If the answer is not in the context, say you don't know.\n\n"
-        f"Context: {context}\n\n"
-        f"Question: {question}"
+        f"Read the passage and answer the question. "
+        f"Give a direct, concise answer in 1-3 sentences.\n\n"
+        f"Passage: {best_chunk}\n\n"
+        f"Question: {question}\n\n"
+        f"Answer:"
     )
+
     try:
-        # Truncate to flan-t5-base's 512-token context window
-        inputs  = tokenizer(
+        inputs = tokenizer(
             prompt,
             return_tensors="pt",
             max_length=512,
             truncation=True,
         )
-        outputs = model.generate(**inputs, max_new_tokens=256)
-        return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            num_beams=4,           # beam search → more coherent output
+            early_stopping=True,
+            no_repeat_ngram_size=3,
+        )
+        answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        if not answer:
+            answer = "I couldn't find a clear answer in the retrieved passages."
+        return answer
     except Exception as exc:
         return f"⚠️ HuggingFace error: {exc}"
 
@@ -214,51 +225,38 @@ def generate_answer(context: str, question: str) -> str:
 # ---------------------------------------------------------------------------
 
 def rag_query(question: str) -> dict:
-    """
-    Full RAG pipeline:
-      embed → search VecDB → lookup chunk texts → generate LLM answer
-    Returns dict: {answer, sources, latency_ms}
-    """
+    """embed → search VecDB → lookup chunk texts → generate LLM answer"""
     client   = load_client()
     embedder = load_embedder()
     chunks   = load_chunks()
 
     t0 = time.time()
 
-    # 1. Embed the question
-    query_vec = embedder.encode(
-        question,
-        normalize_embeddings=True,
-    ).tolist()
-
-    # 2. Retrieve top-K from VecDB
-    results = client.search(query_vec, k=TOP_K)
+    query_vec = embedder.encode(question, normalize_embeddings=True).tolist()
+    results   = client.search(query_vec, k=TOP_K)
 
     if not results:
         return {
-            "answer": "⚠️ No results returned from VecDB. Is the server running and are documents ingested?",
-            "sources": [],
+            "answer":     "⚠️ No results from VecDB. Is the server running and are documents ingested?",
+            "sources":    [],
             "latency_ms": (time.time() - t0) * 1000,
         }
 
-    # 3. Resolve chunk text from sidecar
     retrieved: list[dict] = []
     for r in results:
-        chunk_meta = chunks.get(str(r.id), {})
+        meta = chunks.get(str(r.id), {})
         retrieved.append({
             "id":          r.id,
             "distance":    r.distance,
-            "text":        chunk_meta.get("text", "[chunk not found in chunks.json]"),
-            "source":      chunk_meta.get("source", "unknown"),
-            "chunk_index": chunk_meta.get("chunk_index", 0),
+            "text":        meta.get("text", "[chunk not found]"),
+            "source":      meta.get("source", "unknown"),
+            "chunk_index": meta.get("chunk_index", 0),
         })
 
-    # 4. Build context string for LLM
     context = "\n\n---\n\n".join(
         f"[Source: {c['source']}]\n{c['text']}" for c in retrieved
     )
 
-    # 5. Generate answer
     answer = generate_answer(context, question)
 
     return {
@@ -269,26 +267,59 @@ def rag_query(question: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Helper: submit a query and update session state
+# ---------------------------------------------------------------------------
+
+def _submit(question: str) -> None:
+    """Run RAG query and append user + assistant messages to history."""
+    st.session_state.messages.append({"role": "user", "content": question})
+
+    with st.spinner("🔍 Retrieving and generating answer…"):
+        result = rag_query(question)
+
+    n        = st.session_state.total_queries
+    prev_avg = st.session_state.avg_latency
+    st.session_state.total_queries = n + 1
+    st.session_state.avg_latency   = (prev_avg * n + result["latency_ms"]) / (n + 1)
+
+    st.session_state.messages.append({
+        "role":       "assistant",
+        "content":    result["answer"],
+        "sources":    result["sources"],
+        "latency_ms": result["latency_ms"],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Session state initialisation
 # ---------------------------------------------------------------------------
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "total_queries" not in st.session_state:
-    st.session_state.total_queries = 0
-
-if "avg_latency" not in st.session_state:
-    st.session_state.avg_latency = 0.0
+for _key, _val in [
+    ("messages",      []),
+    ("total_queries", 0),
+    ("avg_latency",   0.0),
+    ("pending_rerun", None),   # stores prompt text for re-run requests
+]:
+    if _key not in st.session_state:
+        st.session_state[_key] = _val
 
 # ---------------------------------------------------------------------------
-# Resolve server / chunk state ONCE at top level so both sidebar and the
-# chat input can reference the same variables safely.
+# Top-level state: server + chunks (used by sidebar AND chat input)
 # ---------------------------------------------------------------------------
-_client    = load_client()
-_chunks    = load_chunks()
-server_ok  = _client.ping()
-chunks_ok  = bool(_chunks)
+_client   = load_client()
+_chunks   = load_chunks()
+server_ok = _client.ping()
+chunks_ok = bool(_chunks)
+
+# ---------------------------------------------------------------------------
+# Handle re-run requests BEFORE rendering the UI so the new message
+# appears immediately without a second click.
+# ---------------------------------------------------------------------------
+if st.session_state.pending_rerun is not None:
+    prompt_to_rerun = st.session_state.pending_rerun
+    st.session_state.pending_rerun = None
+    _submit(prompt_to_rerun)
+    st.rerun()
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -324,7 +355,6 @@ with st.sidebar:
             "⚠️ VecDB server unreachable.\n\n"
             "Start it with:\n```\n./build-release/vecdb_server\n```"
         )
-
     if not chunks_ok:
         st.warning(
             "⚠️ No chunks found.\n\n"
@@ -342,14 +372,36 @@ st.markdown(
 )
 st.divider()
 
-# Render chat history
-for msg in st.session_state.messages:
+# Render conversation history
+for idx, msg in enumerate(st.session_state.messages):
     if msg["role"] == "user":
+        # ── User bubble ──────────────────────────────────────────────────
         st.markdown(
             f'<div class="chat-bubble-user">👤 {msg["content"]}</div>',
             unsafe_allow_html=True,
         )
+
+        # Action row: Copy · Re-run
+        # Use a unique key per message so Streamlit doesn't confuse buttons.
+        col_copy, col_rerun, col_spacer = st.columns([1, 1, 8])
+
+        with col_copy:
+            if st.button("📋 Copy", key=f"copy_{idx}", help="Show prompt text to copy"):
+                # Toggle a per-message "show copy" flag
+                flag = f"show_copy_{idx}"
+                st.session_state[flag] = not st.session_state.get(flag, False)
+
+        with col_rerun:
+            if st.button("🔄 Re-run", key=f"rerun_{idx}", help="Submit this prompt again"):
+                st.session_state.pending_rerun = msg["content"]
+                st.rerun()
+
+        # If copy is toggled on, show a code block (has a native copy button)
+        if st.session_state.get(f"show_copy_{idx}", False):
+            st.code(msg["content"], language=None)
+
     else:
+        # ── Assistant bubble ─────────────────────────────────────────────
         st.markdown(
             f'<div class="chat-bubble-ai">🤖 {msg["content"]}</div>',
             unsafe_allow_html=True,
@@ -360,8 +412,7 @@ for msg in st.session_state.messages:
                 f"⏱ {msg['latency_ms']:.0f} ms"
             ):
                 for i, src in enumerate(msg["sources"], start=1):
-                    # distance is 1 - cosine_similarity, so similarity = 1 - distance
-                    similarity_pct = max(0.0, (1.0 - src["distance"])) * 100
+                    similarity_pct = max(0.0, 1.0 - src["distance"]) * 100
                     st.markdown(
                         f'<div class="source-card">'
                         f'<strong>#{i}</strong> · <code>{src["source"]}</code> '
@@ -372,29 +423,14 @@ for msg in st.session_state.messages:
                         unsafe_allow_html=True,
                     )
 
-# Chat input — disabled when server or chunks missing
+# ---------------------------------------------------------------------------
+# Chat input
+# ---------------------------------------------------------------------------
 user_input = st.chat_input(
     placeholder="Ask a question about your documents…",
     disabled=not server_ok or not chunks_ok,
 )
 
 if user_input:
-    st.session_state.messages.append({"role": "user", "content": user_input})
-
-    with st.spinner("🔍 Retrieving and generating answer…"):
-        result = rag_query(user_input)
-
-    # Running average latency
-    n        = st.session_state.total_queries
-    prev_avg = st.session_state.avg_latency
-    st.session_state.total_queries = n + 1
-    st.session_state.avg_latency   = (prev_avg * n + result["latency_ms"]) / (n + 1)
-
-    st.session_state.messages.append({
-        "role":       "assistant",
-        "content":    result["answer"],
-        "sources":    result["sources"],
-        "latency_ms": result["latency_ms"],
-    })
-
+    _submit(user_input)
     st.rerun()

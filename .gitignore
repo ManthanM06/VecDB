@@ -49,3 +49,6 @@ __pycache__/
 build_cmds.txt
 *.vec
 chunks.json
+
+# Streamlit local config (machine-specific)
+.streamlit/

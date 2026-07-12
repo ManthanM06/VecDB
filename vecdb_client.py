@@ -176,14 +176,19 @@ class VecDBClient:
             return False
 
     def ping(self) -> bool:
-        """Quick health check — returns True if the server is reachable."""
+        """
+        Quick health check — returns True if the server TCP port is open.
+        Uses a raw socket so it's completely dimension-agnostic (the old
+        approach sent a 1-dim vector to a 384-dim server, always getting 400).
+        """
+        import socket
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.base_url)
+        host   = parsed.hostname or "localhost"
+        port   = parsed.port or 8080
         try:
-            # Use a zero-vector search; if the db is empty it returns [] gracefully
-            self.session.post(
-                f"{self.base_url}/search",
-                json={"vector": [0.0], "k": 1},
-                timeout=3.0,
-            )
-            return True
-        except requests.RequestException:
+            with socket.create_connection((host, port), timeout=2.0):
+                return True
+        except OSError:
             return False

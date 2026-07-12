@@ -149,7 +149,7 @@ def main() -> None:
     print(f"[...] Loading embedding model: {EMBED_MODEL}")
     print("      (first run downloads ~80 MB — subsequent runs use cache)")
     model = SentenceTransformer(EMBED_MODEL)
-    print(f"[✓] Model loaded  |  output dim = {model.get_sentence_embedding_dimension()}")
+    print(f"[✓] Model loaded  |  output dim = {model.get_embedding_dimension()}")
 
     # ---- Scan documents ----------------------------------------------------
     extensions = {".txt", ".md", ".pdf"}

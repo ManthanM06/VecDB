@@ -31,7 +31,7 @@ EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNKS_FILE = "chunks.json"
 TOP_K       = 5                     # chunks to retrieve per query
 OLLAMA_MODEL      = "llama3.2"      # or "mistral", "phi3", etc.
-USE_OLLAMA        = True            # set False to use a small HF model instead
+USE_OLLAMA        = False            # set False to use a small HF model instead
 HF_FALLBACK_MODEL = "google/flan-t5-base"  # lightweight, no GPU needed
 
 # ---------------------------------------------------------------------------
@@ -122,13 +122,17 @@ def load_chunks() -> dict[str, dict]:
 
 @st.cache_resource(show_spinner="Loading HuggingFace LLM…")
 def load_hf_llm():
-    """Load HuggingFace fallback LLM (only when USE_OLLAMA=False)."""
-    from transformers import pipeline  # type: ignore
-    return pipeline(
-        "text2text-generation",
-        model=HF_FALLBACK_MODEL,
-        max_new_tokens=256,
-    )
+    """
+    Load flan-t5-base directly via AutoModel classes.
+    transformers v5 dropped the 'text2text-generation' pipeline task,
+    but the underlying seq2seq model API is unchanged.
+    Returns a (tokenizer, model) tuple cached for the session lifetime.
+    """
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
+
+    tokenizer = AutoTokenizer.from_pretrained(HF_FALLBACK_MODEL)
+    model     = AutoModelForSeq2SeqLM.from_pretrained(HF_FALLBACK_MODEL)
+    return tokenizer, model
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +181,24 @@ def generate_answer_ollama(context: str, question: str) -> str:
 
 
 def generate_answer_hf(context: str, question: str) -> str:
-    """Use the cached HuggingFace pipeline as LLM."""
-    llm = load_hf_llm()
-    prompt = f"Context: {context}\n\nAnswer this question: {question}"
+    """Use cached flan-t5-base (tokenizer + model) as LLM."""
+    tokenizer, model = load_hf_llm()
+    prompt = (
+        f"Answer the following question using only the provided context. "
+        f"If the answer is not in the context, say you don't know.\n\n"
+        f"Context: {context}\n\n"
+        f"Question: {question}"
+    )
     try:
-        out = llm(prompt)
-        return out[0]["generated_text"].strip()
+        # Truncate to flan-t5-base's 512-token context window
+        inputs  = tokenizer(
+            prompt,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+        )
+        outputs = model.generate(**inputs, max_new_tokens=256)
+        return tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
     except Exception as exc:
         return f"⚠️ HuggingFace error: {exc}"
 

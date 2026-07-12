@@ -222,46 +222,7 @@ def generate_answer(context: str, question: str) -> str:
 # RAG pipeline core
 # ---------------------------------------------------------------------------
 
-def rag_query(question: str) -> dict:
-    """embed → search VecDB → lookup chunk texts → generate LLM answer"""
-    client   = load_client()
-    embedder = load_embedder()
-    chunks   = load_chunks()
-
-    t0 = time.time()
-
-    query_vec = embedder.encode(question, normalize_embeddings=True).tolist()
-    results   = client.search(query_vec, k=TOP_K)
-
-    if not results:
-        return {
-            "answer":     "⚠️ No results from VecDB. Is the server running and are documents ingested?",
-            "sources":    [],
-            "latency_ms": (time.time() - t0) * 1000,
-        }
-
-    retrieved: list[dict] = []
-    for r in results:
-        meta = chunks.get(str(r.id), {})
-        retrieved.append({
-            "id":          r.id,
-            "distance":    r.distance,
-            "text":        meta.get("text", "[chunk not found]"),
-            "source":      meta.get("source", "unknown"),
-            "chunk_index": meta.get("chunk_index", 0),
-        })
-
-    context = "\n\n---\n\n".join(
-        f"[Source: {c['source']}]\n{c['text']}" for c in retrieved
-    )
-
-    answer = generate_answer(context, question)
-
-    return {
-        "answer":     answer,
-        "sources":    retrieved,
-        "latency_ms": (time.time() - t0) * 1000,
-    }
+# (rag_query logic moved directly into _submit for dynamic status updates)
 
 
 # ---------------------------------------------------------------------------
@@ -269,22 +230,58 @@ def rag_query(question: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _submit(question: str) -> None:
-    """Run RAG query and append user + assistant messages to history."""
+    """Run RAG query with dynamic status updates and append to history."""
     st.session_state.messages.append({"role": "user", "content": question})
 
-    with st.spinner("🔍 Retrieving and generating answer…"):
-        result = rag_query(question)
+    with st.status("Thinking...", expanded=True) as status:
+        client   = load_client()
+        embedder = load_embedder()
+        chunks   = load_chunks()
+
+        t0 = time.time()
+        
+        status.update(label="Embedding query...", state="running")
+        query_vec = embedder.encode(question, normalize_embeddings=True).tolist()
+        
+        status.update(label="Retrieving context from VecDB...", state="running")
+        results   = client.search(query_vec, k=TOP_K)
+
+        if not results:
+            answer = "⚠️ No results from VecDB. Is the server running and are documents ingested?"
+            retrieved = []
+        else:
+            status.update(label="Formatting context...", state="running")
+            retrieved: list[dict] = []
+            for r in results:
+                meta = chunks.get(str(r.id), {})
+                retrieved.append({
+                    "id":          r.id,
+                    "distance":    r.distance,
+                    "text":        meta.get("text", "[chunk not found]"),
+                    "source":      meta.get("source", "unknown"),
+                    "chunk_index": meta.get("chunk_index", 0),
+                })
+            
+            context = "\n\n---\n\n".join(
+                f"[Source: {c['source']}]\n{c['text']}" for c in retrieved
+            )
+            
+            status.update(label="Generating response...", state="running")
+            answer = generate_answer(context, question)
+        
+        latency_ms = (time.time() - t0) * 1000
+        status.update(label=f"Done in {latency_ms:.0f} ms", state="complete")
 
     n        = st.session_state.total_queries
     prev_avg = st.session_state.avg_latency
     st.session_state.total_queries = n + 1
-    st.session_state.avg_latency   = (prev_avg * n + result["latency_ms"]) / (n + 1)
+    st.session_state.avg_latency   = (prev_avg * n + latency_ms) / (n + 1)
 
     st.session_state.messages.append({
         "role":       "assistant",
-        "content":    result["answer"],
-        "sources":    result["sources"],
-        "latency_ms": result["latency_ms"],
+        "content":    answer,
+        "sources":    retrieved,
+        "latency_ms": latency_ms,
     })
 
 
@@ -380,17 +377,17 @@ for idx, msg in enumerate(st.session_state.messages):
         )
 
         # Action row: Copy · Re-run
-        # Use a unique key per message so Streamlit doesn't confuse buttons.
-        col_copy, col_rerun, col_spacer = st.columns([1, 1, 8])
+        # Push buttons to the right to align nicely under the user bubble
+        col_spacer, col_copy, col_rerun = st.columns([8, 0.5, 0.5])
 
         with col_copy:
-            if st.button("📋 Copy", key=f"copy_{idx}", help="Show prompt text to copy"):
+            if st.button("", icon=":material/content_copy:", key=f"copy_{idx}", help="Show prompt text to copy"):
                 # Toggle a per-message "show copy" flag
                 flag = f"show_copy_{idx}"
                 st.session_state[flag] = not st.session_state.get(flag, False)
 
         with col_rerun:
-            if st.button("🔄 Re-run", key=f"rerun_{idx}", help="Submit this prompt again"):
+            if st.button("", icon=":material/refresh:", key=f"rerun_{idx}", help="Submit this prompt again"):
                 st.session_state.pending_rerun = msg["content"]
                 st.rerun()
 

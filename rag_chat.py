@@ -17,8 +17,10 @@ import json
 import os
 import time
 from pathlib import Path
+from threading import Thread
 
 import streamlit as st
+import streamlit.components.v1 as components
 from sentence_transformers import SentenceTransformer
 
 from vecdb_client import VecDBClient
@@ -50,65 +52,262 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300;0,14..32,400;0,14..32,500;0,14..32,600;0,14..32,700&display=swap');
 
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    .main { background: #0d0f14; }
+    /* ── Global ─────────────────────────────────────────────── */
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        -webkit-font-smoothing: antialiased;
+    }
 
+    /* App background */
+    .stApp {
+        background: #080a0f;
+    }
+    .main .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 6rem;
+    }
+
+    /* ── Sidebar ────────────────────────────────────────────── */
+    [data-testid="stSidebar"] {
+        background: rgba(12, 14, 20, 0.95);
+        border-right: 1px solid rgba(255,255,255,0.06);
+    }
+    [data-testid="stSidebar"] .stMarkdown h2 {
+        font-size: 1.05rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        color: #a5b4fc;
+        margin-bottom: 0;
+    }
+
+    /* ── Page header ────────────────────────────────────────── */
+    .page-header {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 6px;
+    }
+    .page-header h1 {
+        font-size: 1.65rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        background: linear-gradient(135deg, #a5b4fc 0%, #818cf8 50%, #6366f1 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        margin: 0;
+    }
+    .page-subtitle {
+        font-size: 0.85rem;
+        color: #64748b;
+        margin-bottom: 1rem;
+        font-weight: 400;
+        letter-spacing: 0.01em;
+    }
+
+    /* ── Chat bubbles ────────────────────────────────────────── */
     .chat-bubble-user {
-        background: linear-gradient(135deg, #4f46e5, #7c3aed);
-        color: white;
-        padding: 12px 18px;
-        border-radius: 18px 18px 4px 18px;
-        margin: 6px 0 2px 0;
-        max-width: 80%;
+        background: linear-gradient(145deg, #312e81, #1e1b4b);
+        color: #e0e7ff;
+        padding: 11px 16px;
+        border-radius: 20px 20px 5px 20px;
+        margin: 4px 0 2px 0;
+        max-width: 75%;
         margin-left: auto;
-        box-shadow: 0 4px 15px rgba(79, 70, 229, 0.3);
+        width: fit-content;
+        border: 1px solid rgba(99, 102, 241, 0.4);
+        box-shadow: 0 4px 24px rgba(79, 70, 229, 0.25),
+                    0 1px 0 rgba(255,255,255,0.05) inset;
+        font-size: 0.925rem;
+        line-height: 1.55;
+        letter-spacing: 0.01em;
     }
     .chat-bubble-ai {
-        background: #1e2130;
-        color: #e2e8f0;
-        padding: 12px 18px;
-        border-radius: 18px 18px 18px 4px;
-        margin: 8px 0;
-        max-width: 85%;
-        border: 1px solid #2d3748;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+        background: rgba(30, 33, 48, 0.85);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        color: #cbd5e1;
+        padding: 13px 17px;
+        border-radius: 5px 20px 20px 20px;
+        margin: 6px 0;
+        max-width: 82%;
+        width: fit-content;
+        border: 1px solid rgba(255,255,255,0.07);
+        box-shadow: 0 4px 24px rgba(0,0,0,0.35);
         white-space: pre-wrap;
+        font-size: 0.925rem;
+        line-height: 1.6;
+        letter-spacing: 0.005em;
     }
+    /* streaming cursor pulse */
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    .chat-bubble-ai .cursor { animation: blink 0.9s ease infinite; }
+
+    /* ── Source cards ────────────────────────────────────────── */
     .source-card {
-        background: #161824;
-        border: 1px solid #2d3748;
-        border-left: 3px solid #4f46e5;
-        border-radius: 8px;
+        background: rgba(15, 17, 26, 0.9);
+        border: 1px solid rgba(255,255,255,0.06);
+        border-left: 2px solid #6366f1;
+        border-radius: 10px;
         padding: 10px 14px;
-        margin: 4px 0;
-        font-size: 0.82em;
-        color: #94a3b8;
+        margin: 6px 0;
+        font-size: 0.8rem;
+        color: #64748b;
+        transition: border-color 0.2s;
     }
-    /* shrink action buttons beneath user bubbles */
-    .action-row button {
-        font-size: 0.75em !important;
-        padding: 2px 8px !important;
+    .source-card:hover { border-left-color: #a5b4fc; color: #94a3b8; }
+    .source-card code {
+        background: rgba(99,102,241,0.15);
+        color: #a5b4fc;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.78rem;
     }
+
+    /* ── Bottom input bar ────────────────────────────────────── */
+    [data-testid="stBottomBlockContainer"] {
+        background: rgba(8, 10, 15, 0.92);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border-top: 1px solid rgba(255,255,255,0.06);
+        padding: 12px 1rem 18px 1rem;
+    }
+    /* input field */
+    [data-testid="stBottomBlockContainer"] [data-testid="stTextInput"] input {
+        background: rgba(22, 25, 38, 0.9) !important;
+        border: 1px solid rgba(99, 102, 241, 0.3) !important;
+        border-radius: 12px !important;
+        color: #e2e8f0 !important;
+        font-family: 'Inter', sans-serif !important;
+        font-size: 0.9rem !important;
+        padding: 10px 14px !important;
+        transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    [data-testid="stBottomBlockContainer"] [data-testid="stTextInput"] input:focus {
+        border-color: rgba(99, 102, 241, 0.7) !important;
+        box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12) !important;
+    }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    [data-testid="stButton"] > button {
+        border-radius: 10px !important;
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 500 !important;
+        transition: all 0.18s ease !important;
+    }
+    /* submit / action button in bottom bar */
+    [data-testid="stBottomBlockContainer"] [data-testid="stButton"] > button {
+        background: linear-gradient(135deg, #4f46e5, #6366f1) !important;
+        border: none !important;
+        color: #fff !important;
+        height: 42px !important;
+        border-radius: 11px !important;
+    }
+    [data-testid="stBottomBlockContainer"] [data-testid="stButton"] > button:hover {
+        background: linear-gradient(135deg, #6366f1, #818cf8) !important;
+        box-shadow: 0 4px 16px rgba(99,102,241,0.4) !important;
+        transform: translateY(-1px) !important;
+    }
+    /* stop button variant */
+    [data-testid="stBottomBlockContainer"] [data-testid="stButton"] > button[kind="secondary"] {
+        background: rgba(239, 68, 68, 0.15) !important;
+        border: 1px solid rgba(239, 68, 68, 0.35) !important;
+        color: #f87171 !important;
+    }
+
+    /* ── Divider ─────────────────────────────────────────────── */
+    hr { border-color: rgba(255,255,255,0.06) !important; }
+
+    /* ── Streamlit toolbar ──────────────────────────────── */
+    header[data-testid="stHeader"] {
+        background: rgba(8, 10, 15, 0.9) !important;
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+
+    /* ── Placeholder + disabled input ─────────────────────── */
+    [data-testid="stBottomBlockContainer"] [data-testid="stTextInput"] input::placeholder {
+        color: rgba(148, 163, 184, 0.45) !important;
+    }
+    [data-testid="stBottomBlockContainer"] [data-testid="stTextInput"] input:disabled {
+        opacity: 0.5 !important;
+    }
+
+    /* ── Bottom bar input height ────────────────────────── */
+    [data-testid="stBottomBlockContainer"] [data-testid="stTextInput"] input {
+        height: 44px !important;
+    }
+
+    /* ── Expander (sources) ────────────────────────────── */
+    [data-testid="stExpander"] {
+        border: 1px solid rgba(255,255,255,0.06) !important;
+        border-radius: 10px !important;
+        background: rgba(15, 17, 26, 0.6) !important;
+    }
+
+    /* ── Scrollbar ─────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.25); border-radius: 10px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,0.45); }
     </style>
     """,
     unsafe_allow_html=True,
 )
+# ---------------------------------------------------------------------------
+# Copy button HTML component generator
+# ---------------------------------------------------------------------------
+def render_copy_button(text_to_copy: str):
+    escaped_text = text_to_copy.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
+    html = f"""
+    <style>
+    body {{ margin: 0; padding: 0; background: transparent; display: flex; align-items: center; justify-content: center; height: 100vh; }}
+    button {{
+        background: transparent; border: 1px solid rgba(250, 250, 250, 0.2); 
+        cursor: pointer; color: #a1a1aa; border-radius: 6px; 
+        width: 100%; height: 36px;
+        display: flex; align-items: center; justify-content: center;
+        transition: all 0.2s; margin-top: 1px;
+    }}
+    button:hover {{ color: #fff; border-color: #4f46e5; background: rgba(79, 70, 229, 0.1); }}
+    svg {{ width: 16px; height: 16px; }}
+    </style>
+    <button onclick="copyToClipboard()" title="Copy prompt">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+        </svg>
+    </button>
+    <script>
+    function copyToClipboard() {{
+        var temp = document.createElement("textarea");
+        temp.value = `{escaped_text}`;
+        document.body.appendChild(temp);
+        temp.select();
+        document.execCommand("copy");
+        document.body.removeChild(temp);
+        
+        const btn = document.querySelector('button');
+        const oldIcon = btn.innerHTML;
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+        setTimeout(() => {{ btn.innerHTML = oldIcon; }}, 2000);
+    }}
+    </script>
+    """
+    components.html(html, height=38)
 
 # ---------------------------------------------------------------------------
 # Cached resources
 # ---------------------------------------------------------------------------
-
-@st.cache_resource(show_spinner="Loading embedding model…")
+@st.cache_resource(show_spinner=False)
 def load_embedder() -> SentenceTransformer:
     return SentenceTransformer(EMBED_MODEL)
-
 
 @st.cache_resource(show_spinner=False)
 def load_client() -> VecDBClient:
     return VecDBClient(VECDB_URL)
-
 
 @st.cache_data(show_spinner=False)
 def load_chunks() -> dict[str, dict]:
@@ -118,28 +317,20 @@ def load_chunks() -> dict[str, dict]:
             return json.load(f)
     return {}
 
-
-@st.cache_resource(show_spinner="Loading HuggingFace LLM…")
+@st.cache_resource(show_spinner=False)
 def load_hf_llm():
-    """
-    Load flan-t5-base via AutoModel (transformers v5 dropped the
-    'text2text-generation' pipeline task, so we use the model directly).
-    """
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
-
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(HF_FALLBACK_MODEL)
     model     = AutoModelForSeq2SeqLM.from_pretrained(HF_FALLBACK_MODEL)
     return tokenizer, model
 
 
 # ---------------------------------------------------------------------------
-# LLM answer generation
+# LLM answer generation (Streaming)
 # ---------------------------------------------------------------------------
-
-def generate_answer_ollama(context: str, question: str) -> str:
+def generate_answer_ollama_stream(context: str, question: str):
     try:
-        import ollama  # noqa: PLC0415
-
+        import ollama
         prompt = (
             "You are a precise assistant. Answer the question using ONLY the "
             "provided context. If the answer is not in the context, say you "
@@ -150,13 +341,14 @@ def generate_answer_ollama(context: str, question: str) -> str:
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
+            stream=True
         )
-        return response.message.content.strip()
-
+        for chunk in response:
+            yield chunk['message']['content']
     except Exception as exc:
         err = str(exc)
         if "connect" in err.lower() or "connection" in err.lower():
-            return (
+            yield (
                 "⚠️ **Ollama is not running.**\n\n"
                 "Start it in a separate terminal:\n"
                 "```\nollama serve\n```\n"
@@ -165,92 +357,230 @@ def generate_answer_ollama(context: str, question: str) -> str:
                 "Or set `USE_OLLAMA = False` in `rag_chat.py` to use the "
                 "built-in HuggingFace fallback instead."
             )
-        return f"⚠️ Ollama error: {exc}"
+        else:
+            yield f"⚠️ Ollama error: {exc}"
 
-
-def generate_answer_hf(context: str, question: str) -> str:
+def generate_answer_hf_stream(context: str, question: str):
     """
-    Inference with flan-t5-base.
-
-    Prompt strategy:
-    - Use only the single most-relevant chunk (first in retrieved list) to
-      stay well within flan-t5-base's 512-token limit.
-    - Phrase as a direct extractive QA instruction — flan-t5 was trained on
-      tasks like this and handles them better than open-ended generation.
-    - Beam search (num_beams=4) gives more coherent answers than greedy.
+    Generate an answer using the HuggingFace fallback model.
+    Uses the full retrieved context (all chunks) and a larger token budget.
     """
     tokenizer, model = load_hf_llm()
 
-    # Use only the highest-similarity chunk to keep the prompt tight
-    best_chunk = context.split("\n\n---\n\n")[0]
-
+    # Use all retrieved chunks, not just the first one
     prompt = (
-        f"Based on the following text, answer this question: {question}\n\n"
-        f"Text: {best_chunk}\n\n"
+        f"Answer the question using only the information in the context below. "
+        f"Be specific and concise.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n\n"
         f"Answer:"
     )
 
     try:
+        from transformers import TextIteratorStreamer
+        # Allow up to 1024 input tokens to fit more context
         inputs = tokenizer(
             prompt,
             return_tensors="pt",
-            max_length=512,
+            max_length=1024,
             truncation=True,
         )
-        outputs = model.generate(
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        generation_kwargs = dict(
             **inputs,
-            max_new_tokens=128,
-            num_beams=4,           # beam search → more coherent output
-            early_stopping=True,
+            max_new_tokens=256,       # was 128 — allow longer, more complete answers
+            num_beams=4,              # beam search for better quality
+            length_penalty=1.2,       # encourage complete sentences
             no_repeat_ngram_size=3,
+            streamer=streamer,
         )
-        answer = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        if not answer:
-            answer = "I couldn't find a clear answer in the retrieved passages."
-        return answer
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        for new_text in streamer:
+            yield new_text
+
     except Exception as exc:
-        return f"⚠️ HuggingFace error: {exc}"
-
-
-def generate_answer(context: str, question: str) -> str:
-    if USE_OLLAMA:
-        return generate_answer_ollama(context, question)
-    return generate_answer_hf(context, question)
-
+        yield f"⚠️ HuggingFace error: {exc}"
 
 # ---------------------------------------------------------------------------
-# RAG pipeline core
+# Session state initialisation & Callbacks
 # ---------------------------------------------------------------------------
+for _key, _val in [
+    ("messages",      []),
+    ("total_queries", 0),
+    ("avg_latency",   0.0),
+    ("pending_rerun", None),   
+    ("draft_input",   ""),
+    ("is_generating", False),
+    ("current_query", ""),
+    ("interrupted",   False),
+]:
+    if _key not in st.session_state:
+        st.session_state[_key] = _val
 
-# (rag_query logic moved directly into _submit for dynamic status updates)
+def submit_callback():
+    # Guard: ignore if already generating
+    if st.session_state.is_generating:
+        return
+    val = st.session_state.draft_input.strip()
+    if val:
+        st.session_state.current_query = val
+        st.session_state.draft_input = ""
+        st.session_state.is_generating = True
+        st.session_state.interrupted = False
+        st.session_state.messages.append({"role": "user", "content": val})
 
+def interrupt_callback():
+    st.session_state.is_generating = False
+    st.session_state.interrupted = True
+    st.session_state.draft_input = st.session_state.current_query
+    
+    # Remove the user message since the generation was aborted
+    if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+        st.session_state.messages.pop()
 
 # ---------------------------------------------------------------------------
-# Helper: submit a query and update session state
+# Top-level state: server + chunks
 # ---------------------------------------------------------------------------
+_client   = load_client()
+_chunks   = load_chunks()
+server_ok = _client.ping()
+chunks_ok = bool(_chunks)
 
-def _submit(question: str) -> None:
-    """Run RAG query with dynamic status updates and append to history."""
-    st.session_state.messages.append({"role": "user", "content": question})
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("## VecDB RAG")
+    st.markdown("*Retrieval-Augmented Generation*")
+    st.divider()
 
-    with st.status("Thinking...", expanded=True) as status:
+    status_dot = '<span style="color:#22c55e;font-size:0.7rem">●</span>' if server_ok else '<span style="color:#ef4444;font-size:0.7rem">●</span>'
+    st.markdown(f"**Server** {status_dot} `{VECDB_URL}`", unsafe_allow_html=True)
+    st.markdown(f"**Chunks** &nbsp;`{len(_chunks):,}`", unsafe_allow_html=True)
+    st.markdown(f"**Embedder** &nbsp;`all-MiniLM-L6-v2`", unsafe_allow_html=True)
+    llm_label = f"ollama/{OLLAMA_MODEL}" if USE_OLLAMA else HF_FALLBACK_MODEL
+    st.markdown(f"**LLM** &nbsp;`{llm_label}`", unsafe_allow_html=True)
+    st.markdown(f"**Top-K** &nbsp;`{TOP_K}`", unsafe_allow_html=True)
+
+    st.divider()
+    st.markdown("**Session Stats**")
+    col1, col2 = st.columns(2)
+    col1.metric("Queries", st.session_state.total_queries)
+    col2.metric("Avg Latency", f"{st.session_state.avg_latency:.0f} ms")
+
+    st.divider()
+    if st.button("", icon=":material/delete_sweep:", help="Clear chat history", use_container_width=False):
+        st.session_state.messages      = []
+        st.session_state.total_queries = 0
+        st.session_state.avg_latency   = 0.0
+        st.rerun()
+
+    if not server_ok:
+        st.error("VecDB server unreachable.\n\nStart it with:\n```\n./build-release/vecdb_server\n```")
+    if not chunks_ok:
+        st.warning("No chunks found.\n\nIngest documents first:\n```\npython3 ingest_docs.py docs/\n```")
+
+# ---------------------------------------------------------------------------
+# Main chat area
+# ---------------------------------------------------------------------------
+st.markdown(
+    '<div class="page-header"><h1>VecDB RAG Chat</h1></div>'
+    '<p class="page-subtitle">Ask anything about your ingested documents — '
+    'VecDB retrieves the most semantically relevant passages and grounds the answer.</p>',
+    unsafe_allow_html=True,
+)
+st.divider()
+
+def render_user_msg(idx: int, content: str):
+    st.markdown(f'<div class="chat-bubble-user">{content}</div>', unsafe_allow_html=True)
+    cols = st.columns([8.6, 0.7, 0.7])
+    with cols[1]:
+        render_copy_button(content)
+    with cols[2]:
+        if st.button("", icon=":material/refresh:", key=f"rerun_{idx}", help="Submit this prompt again", use_container_width=True):
+            st.session_state.pending_rerun = content
+            st.rerun()
+
+def render_ai_msg(content: str, sources: list = None, latency_ms: float = 0):
+    st.markdown(f'<div class="chat-bubble-ai">{content}</div>', unsafe_allow_html=True)
+    if sources:
+        with st.expander(f"{len(sources)} sources  ·  {latency_ms:.0f} ms"):
+            for i, src in enumerate(sources, start=1):
+                similarity_pct = max(0.0, 1.0 - src["distance"]) * 100
+                st.markdown(
+                    f'<div class="source-card">'
+                    f'<strong>#{i}</strong> &nbsp;<code>{src["source"]}</code> '
+                    f'&nbsp;chunk&nbsp;{src["chunk_index"]} '
+                    f'&nbsp;·&nbsp; {similarity_pct:.1f}% match<br><br>'
+                    f'{src["text"][:400]}{"…" if len(src["text"]) > 400 else ""}'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+# Render conversation history
+for idx, msg in enumerate(st.session_state.messages):
+    if msg["role"] == "user":
+        render_user_msg(idx, msg["content"])
+    else:
+        render_ai_msg(msg["content"], msg.get("sources"), msg.get("latency_ms", 0))
+
+# ---------------------------------------------------------------------------
+# Custom Chat Input (Pinned to bottom)
+# ---------------------------------------------------------------------------
+with st.bottom:
+    cols = st.columns([9, 1])
+    with cols[0]:
+        st.text_input(
+            "Ask a question...",
+            key="draft_input",
+            label_visibility="collapsed",
+            placeholder="Ask a question about your documents…",
+            on_change=submit_callback,
+            disabled=st.session_state.is_generating or not server_ok or not chunks_ok
+        )
+    with cols[1]:
+        if st.session_state.is_generating:
+            st.button("", icon=":material/stop:", key="stop_btn", help="Stop generation",
+                      on_click=interrupt_callback, use_container_width=True, type="secondary")
+        else:
+            st.button("", icon=":material/arrow_upward:", key="submit_btn", help="Send",
+                      on_click=submit_callback, use_container_width=True,
+                      disabled=not server_ok or not chunks_ok)
+
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
+# If a rerun was requested, trigger submit
+if st.session_state.pending_rerun:
+    st.session_state.current_query = st.session_state.pending_rerun
+    st.session_state.pending_rerun = None
+    st.session_state.is_generating = True
+    st.session_state.interrupted = False
+    st.session_state.messages.append({"role": "user", "content": st.session_state.current_query})
+    st.rerun()
+
+if st.session_state.is_generating:
+    with st.spinner("Generating response..."):
         client   = load_client()
         embedder = load_embedder()
         chunks   = load_chunks()
 
         t0 = time.time()
-        
-        status.update(label="Embedding query...", state="running")
-        query_vec = embedder.encode(question, normalize_embeddings=True).tolist()
-        
-        status.update(label="Retrieving context from VecDB...", state="running")
+        query_vec = embedder.encode(st.session_state.current_query, normalize_embeddings=True).tolist()
         results   = client.search(query_vec, k=TOP_K)
+
+        # Initialise so variables are always bound regardless of branch taken
+        answer    = ""
+        retrieved = []
 
         if not results:
             answer = "⚠️ No results from VecDB. Is the server running and are documents ingested?"
             retrieved = []
+            st.markdown(f'<div class="chat-bubble-ai">{answer}</div>', unsafe_allow_html=True)
         else:
-            status.update(label="Formatting context...", state="running")
             retrieved: list[dict] = []
             for r in results:
                 meta = chunks.get(str(r.id), {})
@@ -266,17 +596,28 @@ def _submit(question: str) -> None:
                 f"[Source: {c['source']}]\n{c['text']}" for c in retrieved
             )
             
-            status.update(label="Generating response...", state="running")
-            answer = generate_answer(context, question)
-        
+            # Streaming generation loop
+            if USE_OLLAMA:
+                stream = generate_answer_ollama_stream(context, st.session_state.current_query)
+            else:
+                stream = generate_answer_hf_stream(context, st.session_state.current_query)
+            
+            answer = ""
+            placeholder = st.empty()
+            
+            for chunk in stream:
+                answer += chunk
+                placeholder.markdown(f'<div class="chat-bubble-ai">{answer}▌</div>', unsafe_allow_html=True)
+                time.sleep(0.01) # Yield a tiny bit to event loop
+                
+            placeholder.empty()
+
         latency_ms = (time.time() - t0) * 1000
-        status.update(label=f"Done in {latency_ms:.0f} ms", state="complete")
 
-    n        = st.session_state.total_queries
-    prev_avg = st.session_state.avg_latency
-    st.session_state.total_queries = n + 1
-    st.session_state.avg_latency   = (prev_avg * n + latency_ms) / (n + 1)
-
+    # Output the answer and sources directly
+    render_ai_msg(answer, retrieved, latency_ms)
+    
+    # Append assistant message to state
     st.session_state.messages.append({
         "role":       "assistant",
         "content":    answer,
@@ -284,148 +625,12 @@ def _submit(question: str) -> None:
         "latency_ms": latency_ms,
     })
 
-
-# ---------------------------------------------------------------------------
-# Session state initialisation
-# ---------------------------------------------------------------------------
-
-for _key, _val in [
-    ("messages",      []),
-    ("total_queries", 0),
-    ("avg_latency",   0.0),
-    ("pending_rerun", None),   # stores prompt text for re-run requests
-]:
-    if _key not in st.session_state:
-        st.session_state[_key] = _val
-
-# ---------------------------------------------------------------------------
-# Top-level state: server + chunks (used by sidebar AND chat input)
-# ---------------------------------------------------------------------------
-_client   = load_client()
-_chunks   = load_chunks()
-server_ok = _client.ping()
-chunks_ok = bool(_chunks)
-
-# ---------------------------------------------------------------------------
-# Handle re-run requests BEFORE rendering the UI so the new message
-# appears immediately without a second click.
-# ---------------------------------------------------------------------------
-if st.session_state.pending_rerun is not None:
-    prompt_to_rerun = st.session_state.pending_rerun
-    st.session_state.pending_rerun = None
-    _submit(prompt_to_rerun)
-    st.rerun()
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.markdown("## 🔍 VecDB RAG")
-    st.markdown("*Retrieval-Augmented Generation*")
-    st.divider()
-
-    status_icon = "🟢" if server_ok else "🔴"
-    st.markdown(f"**Server:** {status_icon} `{VECDB_URL}`")
-    st.markdown(f"**Chunks indexed:** `{len(_chunks):,}`")
-    st.markdown(f"**Embedding model:** `all-MiniLM-L6-v2`")
-    llm_label = f"ollama/{OLLAMA_MODEL}" if USE_OLLAMA else HF_FALLBACK_MODEL
-    st.markdown(f"**LLM:** `{llm_label}`")
-    st.markdown(f"**Top-K retrieval:** `{TOP_K}`")
-
-    st.divider()
-    st.markdown("### 📊 Session Stats")
-    col1, col2 = st.columns(2)
-    col1.metric("Queries", st.session_state.total_queries)
-    col2.metric("Avg Latency", f"{st.session_state.avg_latency:.0f} ms")
-
-    st.divider()
-    if st.button("🗑️ Clear chat history"):
-        st.session_state.messages      = []
-        st.session_state.total_queries = 0
-        st.session_state.avg_latency   = 0.0
-        st.rerun()
-
-    if not server_ok:
-        st.error(
-            "⚠️ VecDB server unreachable.\n\n"
-            "Start it with:\n```\n./build-release/vecdb_server\n```"
-        )
-    if not chunks_ok:
-        st.warning(
-            "⚠️ No chunks found.\n\n"
-            "Ingest documents first:\n"
-            "```\npython3 ingest_docs.py docs/\n```"
-        )
-
-# ---------------------------------------------------------------------------
-# Main chat area
-# ---------------------------------------------------------------------------
-st.markdown("# 💬 VecDB RAG Chat")
-st.markdown(
-    "Ask any question about your ingested documents. "
-    "VecDB retrieves the most semantically relevant passages and grounds the answer."
-)
-st.divider()
-
-# Render conversation history
-for idx, msg in enumerate(st.session_state.messages):
-    if msg["role"] == "user":
-        # ── User bubble ──────────────────────────────────────────────────
-        st.markdown(
-            f'<div class="chat-bubble-user">👤 {msg["content"]}</div>',
-            unsafe_allow_html=True,
-        )
-
-        # Action row: Copy · Re-run
-        # Push buttons to the right to align nicely under the user bubble
-        col_spacer, col_copy, col_rerun = st.columns([8, 0.5, 0.5])
-
-        with col_copy:
-            if st.button("", icon=":material/content_copy:", key=f"copy_{idx}", help="Show prompt text to copy"):
-                # Toggle a per-message "show copy" flag
-                flag = f"show_copy_{idx}"
-                st.session_state[flag] = not st.session_state.get(flag, False)
-
-        with col_rerun:
-            if st.button("", icon=":material/refresh:", key=f"rerun_{idx}", help="Submit this prompt again"):
-                st.session_state.pending_rerun = msg["content"]
-                st.rerun()
-
-        # If copy is toggled on, show a code block (has a native copy button)
-        if st.session_state.get(f"show_copy_{idx}", False):
-            st.code(msg["content"], language=None)
-
-    else:
-        # ── Assistant bubble ─────────────────────────────────────────────
-        st.markdown(
-            f'<div class="chat-bubble-ai">🤖 {msg["content"]}</div>',
-            unsafe_allow_html=True,
-        )
-        if msg.get("sources"):
-            with st.expander(
-                f"📎 {len(msg['sources'])} retrieved chunks  ·  "
-                f"⏱ {msg['latency_ms']:.0f} ms"
-            ):
-                for i, src in enumerate(msg["sources"], start=1):
-                    similarity_pct = max(0.0, 1.0 - src["distance"]) * 100
-                    st.markdown(
-                        f'<div class="source-card">'
-                        f'<strong>#{i}</strong> · <code>{src["source"]}</code> '
-                        f'· chunk {src["chunk_index"]} '
-                        f'· similarity {similarity_pct:.1f}%<br><br>'
-                        f'{src["text"][:400]}{"…" if len(src["text"]) > 400 else ""}'
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-
-# ---------------------------------------------------------------------------
-# Chat input
-# ---------------------------------------------------------------------------
-user_input = st.chat_input(
-    placeholder="Ask a question about your documents…",
-    disabled=not server_ok or not chunks_ok,
-)
-
-if user_input:
-    _submit(user_input)
+    # Update stats
+    n = st.session_state.total_queries
+    prev_avg = st.session_state.avg_latency
+    st.session_state.total_queries = n + 1
+    st.session_state.avg_latency = (prev_avg * n + latency_ms) / (n + 1)
+    
+    # Finished generating, reset state and rerun to update UI
+    st.session_state.is_generating = False
     st.rerun()

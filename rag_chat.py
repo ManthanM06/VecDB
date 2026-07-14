@@ -362,36 +362,51 @@ def generate_answer_ollama_stream(context: str, question: str):
 
 def generate_answer_hf_stream(context: str, question: str):
     """
-    Generate an answer using the HuggingFace fallback model.
-    Uses the full retrieved context (all chunks) and a larger token budget.
+    Generate an answer using the HuggingFace flan-t5-base fallback.
+
+    Key constraints of flan-t5-base:
+      - Max input: 512 tokens total (encoder)
+      - Works best with short, direct prompts
+      - Inconsistent with sampling; greedy decoding is more reliable
     """
+    import re
     tokenizer, model = load_hf_llm()
 
-    # Use all retrieved chunks, not just the first one
+    # Use only the top-2 most relevant chunks to stay within the 512-token budget.
+    # All chunks are already ranked by similarity (closest first) by VecDB.
+    top_chunks = context.split("\n\n---\n\n")[:2]
+    clean_ctx = "\n\n".join(top_chunks)
+
+    # Strip markdown headers (##, ###) and source tags — they cost tokens and confuse the model
+    clean_ctx = re.sub(r"\[Source:[^\]]+\]\n?", "", clean_ctx)
+    clean_ctx = re.sub(r"#{1,4}\s+", "", clean_ctx)
+    clean_ctx = re.sub(r"\n{3,}", "\n\n", clean_ctx).strip()
+
+    # Prompt format that matches flan-t5's instruction-tuning style
     prompt = (
-        f"Answer the question using only the information in the context below. "
-        f"Be specific and concise.\n\n"
-        f"Context:\n{context}\n\n"
+        f"Answer the following question based on the context. "
+        f"Give a clear and complete answer.\n\n"
+        f"Context: {clean_ctx}\n\n"
         f"Question: {question}\n\n"
         f"Answer:"
     )
 
     try:
         from transformers import TextIteratorStreamer
-        # Allow up to 1024 input tokens to fit more context
         inputs = tokenizer(
             prompt,
             return_tensors="pt",
-            max_length=1024,
+            max_length=512,    # flan-t5-base hard limit
             truncation=True,
         )
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
         generation_kwargs = dict(
             **inputs,
-            max_new_tokens=256,       # was 128 — allow longer, more complete answers
-            num_beams=4,              # beam search for better quality
-            length_penalty=1.2,       # encourage complete sentences
+            max_new_tokens=200,
+            num_beams=1,              # required for streaming
+            do_sample=False,          # greedy = deterministic, consistent answers
+            repetition_penalty=1.3,   # suppress repeated phrases without sampling
             no_repeat_ngram_size=3,
             streamer=streamer,
         )
@@ -520,12 +535,46 @@ def render_ai_msg(content: str, sources: list = None, latency_ms: float = 0):
                     unsafe_allow_html=True,
                 )
 
+# ---------------------------------------------------------------------------
+# Auto-scroll helper
+# ---------------------------------------------------------------------------
+def scroll_to_bottom():
+    """Smoothly scroll the Streamlit main container to the bottom via injected JS."""
+    components.html(
+        """
+        <script>
+        (function() {
+            // Streamlit renders inside an iframe; walk up to the parent document
+            const doc = window.parent.document;
+            // Try the known Streamlit main-content selectors in priority order
+            const sel = [
+                '[data-testid="stMain"]',
+                '.main',
+                '[data-testid="stAppViewContainer"]',
+            ];
+            for (const s of sel) {
+                const el = doc.querySelector(s);
+                if (el) {
+                    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+                    break;
+                }
+            }
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
 # Render conversation history
 for idx, msg in enumerate(st.session_state.messages):
     if msg["role"] == "user":
         render_user_msg(idx, msg["content"])
     else:
         render_ai_msg(msg["content"], msg.get("sources"), msg.get("latency_ms", 0))
+
+# Scroll to bottom whenever there is content (new submit, rerun-button, or after generation)
+if st.session_state.messages:
+    scroll_to_bottom()
 
 # ---------------------------------------------------------------------------
 # Custom Chat Input (Pinned to bottom)
